@@ -57,6 +57,46 @@ export function safeColor(c, fallback) {
   }
 }
 
+// ---------- icons: stroke SVGs in the current text color (no emoji anywhere) ----------
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const ICONS = {
+  glass: ['M5 4h14l-7 8z', 'M12 12v8', 'M8 20h8'],
+  eye: ['M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7S2.5 12 2.5 12z', 'M12 9a3 3 0 1 0 0 6 3 3 0 1 0 0-6z'],
+  eyeOff: [
+    'M3 3l18 18', 'M10.6 5.1A10 10 0 0 1 12 5c6 0 9.5 7 9.5 7a17 17 0 0 1-3.2 4.1',
+    'M6.6 6.6A17 17 0 0 0 2.5 12S6 19 12 19a9.6 9.6 0 0 0 5.4-1.6', 'M9.9 9.9a3 3 0 0 0 4.2 4.2',
+  ],
+  check: ['M4.5 12.5l5 5L19.5 7'],
+  back: ['M19 12H5', 'M11 6l-6 6 6 6'],
+  userPlus: ['M15 20a6 6 0 0 0-12 0', 'M9 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z', 'M19 8v6', 'M16 11h6'],
+  exit: ['M10 4H5v16h5', 'M14 8l4 4-4 4', 'M18 12H9'],
+};
+
+/** icon('eye', 20) -> a decorative <svg> (aria-hidden; the button's text is its label). */
+export function icon(name, size = 18) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  const attrs = {
+    class: 'icon', viewBox: '0 0 24 24', width: size, height: size, fill: 'none', stroke: 'currentColor',
+    'stroke-width': '2.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false',
+  };
+  for (const [k, v] of Object.entries(attrs)) svg.setAttribute(k, String(v));
+  for (const d of ICONS[name] || []) {
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return svg;
+}
+
+/**
+ * Length of the longest word ("BANK HEIST!" -> 6). Big sticker titles use it as the CSS
+ * variable --fit, so the font shrinks just enough for that word to fit on one line.
+ */
+export function longestWord(s) {
+  return Math.max(1, ...str(s).split(/[\s\-–—]+/).map((w) => w.length));
+}
+
 /** "house_party" -> "House Party" */
 export function titleCase(s) {
   return str(s)

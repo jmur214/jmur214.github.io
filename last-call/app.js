@@ -17,7 +17,7 @@ import {
 } from './protocol.js';
 import * as store from './storage.js';
 import {
-  h, region, obj, arr, str, num, safeColor, titleCase, fmtCountdown, fmtClockTime, buzz, reducedMotion,
+  h, region, obj, arr, str, num, safeColor, titleCase, fmtCountdown, fmtClockTime, buzz, reducedMotion, icon, longestWord,
 } from './ui.js';
 
 // ============================================================================
@@ -29,10 +29,12 @@ const PING_EVERY_MS = 5000; // ...and ping this often while waiting
 const PEEK_MS = 5000; // hidden sections re-cover after this
 const RESULT_MS = 4500; // how long a prompt_close result stays up
 
-const DEFAULT_ACCENT = '#ff3d7f';
+// Card band color when the leader sends no (or a bad) `card.accent`: Sticker Pop "game" teal.
+const DEFAULT_ACCENT = '#2ec4b6';
 const SECTION_STYLES = ['normal', 'secret', 'mission', 'warning', 'good'];
 const ACTION_STYLES = ['primary', 'normal', 'secret', 'mission', 'warning', 'good', 'danger'];
 const BANNER_STYLES = ['interrupt', 'info', 'alert'];
+const BANNER_CHIPS = { interrupt: 'Interrupt!', info: 'Heads up', alert: 'Alert!' };
 const PHASES = {
   lobby: 'Lobby', writing: 'Writing', warmup: 'Warm-up', main: 'Main game',
   lastcall: 'Last Call', finale: 'Finale', ended: "That's a wrap",
@@ -608,7 +610,7 @@ function render() {
 // ---------- shared bits ----------
 
 const brand = () =>
-  h('div', { class: 'brand' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), h('span', { text: 'LAST CALL' }));
+  h('div', { class: 'brand' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, icon('glass', 18)), h('span', { text: 'LAST CALL' }));
 
 function waitingBlock(big) {
   const finding = !S.stale;
@@ -728,7 +730,7 @@ const UPDATE = {
           h('label', { class: 'label', text: "What's your name?" }),
           nameInput,
           h('button', { class: 'btn primary big', 'data-testid': 'join-new', text: "Let's go", onclick: () => startJoin(nameInput.value) }),
-          d.players === true && h('button', { class: 'btn ghost', text: '← Pick my name instead', onclick: () => { S.joinMode = 'pick'; render(); } }),
+          d.players === true && h('button', { class: 'btn ghost', onclick: () => { S.joinMode = 'pick'; render(); } }, icon('back', 20), 'Pick my name instead'),
           cancelAdd,
         ];
       }
@@ -773,12 +775,12 @@ const UPDATE = {
 
     renderCard(room, pid, priv, covered);
 
-    // Curses
+    // Curses: sticker tags. A curse on you is purple; curses on others / everyone are white.
     const curses = arr(room?.curses).map(obj).filter((c) => str(c.text));
-    region(V.curses, curses.map((c) => [c.id, c.text, c.who, num(c.cardsLeft)]), (list) => !list.length ? [] : [
+    region(V.curses, [curses.map((c) => [c.id, c.text, c.who, num(c.cardsLeft)]), pid], ([list, me]) => !list.length ? [] : [
       h('h2', { class: 'section-label', text: list.length > 1 ? `${list.length} curses active` : 'Curse active' }),
       h('ul', { class: 'curse-list' }, list.map(([, text, who, left]) =>
-        h('li', { class: 'curse' },
+        h('li', { class: `curse${me && who === me ? ' mine' : ''}` },
           h('span', { class: 'curse-text', text }),
           h('span', { class: 'curse-meta' },
             h('span', { text: who === 'everyone' || !who ? 'Everyone' : playerName(who) || str(who) }),
@@ -794,8 +796,8 @@ const UPDATE = {
     region(V.me, [sessionName(me), owe, bank, covered], ([name, o, b, cov]) => cov ? [] : [
       h('div', { class: 'me-name' }, h('span', { class: 'dim', text: 'You are' }), h('b', { text: name })),
       h('div', { class: 'me-stats' },
-        h('div', { class: `stat owe${o > 0 ? ' hot' : ''}`, 'data-testid': 'owe' }, h('span', { class: 'stat-n', text: String(o) }), h('span', { class: 'stat-l', text: 'Owe' })),
-        h('div', { class: 'stat bank', 'data-testid': 'bank' }, h('span', { class: 'stat-n', text: String(b) }), h('span', { class: 'stat-l', text: 'Bank' }))),
+        h('div', { class: `stat owe${o > 0 ? ' hot' : ''}`, 'data-testid': 'owe' }, h('span', { class: 'stat-l', text: 'Owe' }), h('span', { class: 'stat-n', text: String(o) })),
+        h('div', { class: 'stat bank', 'data-testid': 'bank' }, h('span', { class: 'stat-l', text: 'Bank' }), h('span', { class: 'stat-n', text: String(b) }))),
     ]);
 
     // Private sections + actions
@@ -812,7 +814,7 @@ const UPDATE = {
         return h('button', {
           class: `btn act ${style}${sent ? ' sent' : ''}`, 'data-action': a.id, disabled: sent,
           onclick: () => pressAction(pid, a),
-        }, sent ? 'Sent ✓' : a.label);
+        }, sent ? [icon('check', 22), 'Sent'] : a.label);
       })),
     ]);
 
@@ -839,8 +841,8 @@ const UPDATE = {
     V.ticker.hidden = !ticker.length;
 
     region(V.foot, [S.sessions.length, covered], ([, cov]) => cov ? [] : [
-      h('button', { class: 'btn ghost small', 'data-testid': 'add-player', text: '+ Someone sharing this phone', onclick: () => { S.addingPlayer = true; S.joinMode = 'pick'; S.joining = null; render(); } }),
-      h('button', { class: 'btn ghost small danger-text', 'data-testid': 'leave', text: 'Leave game', onclick: confirmLeave }),
+      h('button', { class: 'btn ghost small', 'data-testid': 'add-player', onclick: () => { S.addingPlayer = true; S.joinMode = 'pick'; S.joining = null; render(); } }, icon('userPlus'), 'Someone sharing this phone'),
+      h('button', { class: 'btn ghost small danger-text', 'data-testid': 'leave', onclick: confirmLeave }, icon('exit'), 'Leave game'),
     ]);
   },
 
@@ -901,37 +903,49 @@ function renderCard(room, pid, priv, covered) {
       level: num(card.level), accent: safeColor(card.accent, DEFAULT_ACCENT),
       tax: num(card.chickenTax), endsAt: num(obj(card.timer).endsAt),
     },
-    spot: spot && spot.text, covered,
+    spot: spot && spot.text, name: spot ? sessionName(activeSession()) : '', covered,
   };
   region(V.card, data, (d) => {
     if (!d.has) return waitingBlock(true);
     if (!d.card) {
       return h('div', { class: 'card idle' },
-        h('div', { class: 'card-kind', text: PHASES[d.phase] || titleCase(d.phase) || 'Last Call' }),
-        h('p', { class: 'card-text', text: d.ended ? "That's a wrap. Thanks for playing!" : 'Eyes on the Table.' }),
-        d.ended && d.hasRecap && h('button', { class: 'btn primary', text: 'See your recap', onclick: () => { S.recap = pid; render(); } }),
-        !d.ended && d.leader && h('p', { class: 'card-sub', text: `${d.leader} is running the game.` }));
+        h('div', { class: 'card-band' }, h('span', { class: 'card-kind', text: PHASES[d.phase] || titleCase(d.phase) || 'Last Call' })),
+        h('div', { class: 'card-idle-body' },
+          h('p', { class: 'card-text', text: d.ended ? "That's a wrap. Thanks for playing!" : 'Eyes on the Table.' }),
+          d.ended && d.hasRecap && h('button', { class: 'btn primary', text: 'See your recap', onclick: () => { S.recap = pid; render(); } }),
+          !d.ended && d.leader && h('p', { class: 'card-sub', text: `${d.leader} is running the game.` })));
     }
     const c = d.card;
     const len = c.text.length;
-    return h('article', {
-      class: `card${d.spot ? ' is-target' : ''}`, style: { '--accent': c.accent }, 'data-card': c.id,
-    },
-    h('div', { class: 'card-top' },
-      h('span', { class: 'card-kind', text: c.title || titleCase(c.kind) || 'Card' }),
-      c.level != null && levelDots(c.level)),
-    d.spot && h('div', { class: 'spot', 'data-testid': 'spotlight', text: d.spot }),
-    h('p', { class: `card-text${len > 220 ? ' xlong' : len > 120 ? ' long' : ''}`, text: c.text }),
-    (c.tax != null || c.endsAt != null) && h('div', { class: 'card-foot' },
-      c.tax != null && h('span', { class: 'tax', 'data-testid': 'chicken-tax' }, h('span', { text: 'Chicken Tax' }), h('b', { text: String(c.tax) })),
-      c.endsAt != null && h('span', { class: 'timer', 'data-testid': 'card-timer', 'data-ends-at': String(c.endsAt), 'aria-label': 'seconds left' })));
+    return [
+      // "You're up" sticker: only on the targeted player's phone. The leader's own line goes under it.
+      d.spot && h('div', { class: 'spot', 'data-testid': 'spotlight' },
+        h('span', { class: 'spot-head', text: `You're up, ${d.name}!` }),
+        h('span', { class: 'spot-text', text: d.spot })),
+      h('article', {
+        class: `card${d.spot ? ' is-target' : ''}`, style: { '--accent': c.accent }, 'data-card': c.id,
+      },
+      // Colored type band (ink text on every band color), then the card text, then the footer.
+      h('div', { class: 'card-band' },
+        h('span', { class: 'card-kind', text: c.title || titleCase(c.kind) || 'Card' }),
+        c.level != null && levelPips(c.level)),
+      h('p', { class: `card-text${len > 220 ? ' xlong' : len > 120 ? ' long' : ''}`, text: c.text }),
+      (c.tax != null || c.endsAt != null) && h('div', { class: 'card-foot' },
+        c.tax != null && h('div', { class: 'tax-row' },
+          h('span', { class: 'tax-label', text: 'Chicken out?' }),
+          h('span', { class: 'tax', 'data-testid': 'chicken-tax', text: `${c.tax} sip${c.tax === 1 ? '' : 's'}` })),
+        c.endsAt != null && h('span', { class: 'timer', 'data-testid': 'card-timer', 'data-ends-at': String(c.endsAt), 'aria-label': 'seconds left' }))),
+    ];
   });
 }
 
-function levelDots(level) {
+/** "LVL 3" plus five pips, filled in ink up to the level (clamped to 0–5). */
+function levelPips(level) {
   const n = Math.max(0, Math.min(5, Math.round(level)));
-  return h('span', { class: 'dots', role: 'img', 'aria-label': `Level ${n} of 5`, 'data-level': String(n) },
-    [1, 2, 3, 4, 5].map((i) => h('i', { class: i <= n ? 'on' : '' })));
+  return h('span', { class: 'card-level' },
+    h('span', { class: 'card-level-n', 'aria-hidden': 'true', text: `LVL ${n}` }),
+    h('span', { class: 'dots', role: 'img', 'aria-label': `Level ${n} of 5`, 'data-level': String(n) },
+      [1, 2, 3, 4, 5].map((i) => h('i', { class: i <= n ? 'on' : '' }))));
 }
 
 function flash(color) {
@@ -953,20 +967,28 @@ function renderSection(pid, s, peeked) {
     else S.peek[key] = Date.now() + PEEK_MS;
     render();
   };
-  if (s.hidden === true && !peeked) {
+  const hidden = s.hidden === true;
+  if (hidden && !peeked) {
     // Privacy screen: even the title stays hidden (it can say "Your role: The Snake").
     return h('button', { class: 'sec covered', 'data-section': str(s.id), onclick: toggle },
-      h('span', { class: 'peek-eye', 'aria-hidden': 'true' }),
+      icon('eye', 30),
       h('span', { class: 'peek-text', text: 'Tap to peek' }),
       h('span', { class: 'peek-sub', text: "Make sure nobody's looking" }));
   }
+  // Hidden (peeking) and `secret` sections get the black "private look". When peeking, the
+  // content sits on its own sticker card inside it (pink for missions).
+  const privateLook = hidden || style === 'secret';
   return h('div', {
-    class: `sec sec-${style}${s.hidden === true ? ' peeking' : ''}`, 'data-section': str(s.id),
-    onclick: s.hidden === true ? toggle : null,
+    class: `sec sec-${style}${hidden ? ' peeking' : ''}`, 'data-section': str(s.id),
+    onclick: hidden ? toggle : null,
   },
+  privateLook && h('div', { class: 'priv-head' },
+    h('span', { class: 'priv-note' }, icon('eyeOff', 18), 'Only you can see this'),
+    // No handler of its own: the tap bubbles up to the section's toggle, which re-covers it.
+    hidden && h('button', { class: 'btn hide', type: 'button', text: 'Hide' })),
   str(s.title) && h('h3', { class: 'sec-title', text: s.title }),
-  arr(s.lines).map(str).filter(Boolean).map((l) => h('p', { class: 'sec-line', text: l })),
-  s.hidden === true && h('div', { class: 'peek-hint', text: 'Tap to hide · hides itself in 5 s' }));
+  h('div', { class: 'sec-body' }, arr(s.lines).map(str).filter(Boolean).map((l) => h('p', { class: 'sec-line', text: l }))),
+  hidden && h('div', { class: 'peek-hint', text: 'Hides itself in 5 s' }));
 }
 
 // ---------- banner (interrupts) ----------
@@ -979,7 +1001,7 @@ function renderBanner(view) {
     S.bannerMin = false;
     if (b && b.buzz === true) {
       buzz([400, 120, 400]);
-      flash(b.style === 'alert' ? '#ff3b3b' : b.style === 'info' ? '#33e1ff' : '#ffd23f');
+      flash(b.style === 'alert' ? '#ff5a36' : b.style === 'info' ? '#7fd1ff' : '#ffd23f');
     }
   }
   const style = b && BANNER_STYLES.includes(b.style) ? b.style : 'info';
@@ -990,8 +1012,13 @@ function renderBanner(view) {
       return h('button', { class: `banner-strip b-${st}`, onclick: () => { S.bannerMin = false; render(); } },
         h('b', { text: title || 'Heads up' }), text && h('span', { text }));
     }
+    // Full-screen takeover: chip, tilted title sticker, the one-line rule, one huge button.
     return h('div', { class: `banner b-${st}`, role: 'alert', 'data-testid': 'banner' },
-      h('div', { class: 'banner-title', text: title }),
+      h('div', { class: 'banner-top' },
+        h('span', { class: 'banner-chip', text: BANNER_CHIPS[st] }),
+        h('span', { class: 'banner-brand', 'aria-hidden': 'true', text: 'LAST CALL' })),
+      title && h('div', { class: 'banner-sticker' },
+        h('div', { class: 'banner-title', style: { '--fit': String(longestWord(title)) }, text: title })),
       text && h('div', { class: 'banner-text', text }),
       h('button', { class: 'btn ghost', text: 'Got it', onclick: () => { S.bannerMin = true; render(); } }));
   });
@@ -1167,7 +1194,7 @@ function wrappedCard(rec, mode, showName) {
     h('h2', { class: 'wr-title', text: str(w.title) || 'Your night' }),
     showName && rec.name && h('div', { class: 'wr-name', text: rec.name }),
     stats.length > 0 && h('div', { class: 'wr-stats' }, stats.map((s) =>
-      h('div', { class: 'wr-stat' }, h('b', { text: str(s.value) }), h('span', { text: s.label })))),
+      h('div', { class: 'wr-stat' }, h('span', { text: s.label }), h('b', { text: str(s.value) })))),
     arr(w.lines).map(str).filter(Boolean).map((l) => h('p', { class: 'wr-line', text: l })),
     mode === 'tonight' && rec.localShowAt != null && Date.now() < rec.localShowAt &&
       h('p', { class: 'wr-note', text: `Your Morning-After Wrapped unlocks ${sameDay(rec.localShowAt) ? 'at' : 'tomorrow at'} ${fmtClockTime(rec.localShowAt)}. Open this page again then.` }));
@@ -1189,8 +1216,8 @@ function renderCover(view) {
   const name = s ? sessionName(s) : '';
   region(layers.cover, s ? [s.playerId, name] : null, () => s && h('div', { class: 'cover', 'data-testid': 'pass-cover' },
     brand(),
-    h('div', { class: 'cover-title' }, h('span', { text: 'Pass to' }), h('b', { text: name })),
-    h('p', { class: 'cover-sub', text: 'Everyone else look away.' }),
+    h('div', { class: 'cover-title' }, h('span', { text: 'Pass to' }), h('b', { style: { '--fit': String(longestWord(name)) }, text: name })),
+    h('p', { class: 'cover-sub' }, icon('eyeOff', 22), 'Everyone else look away.'),
     h('button', { class: 'btn primary big', 'data-testid': 'reveal', text: `I'm ${name} — show me`, onclick: uncover })));
 }
 
