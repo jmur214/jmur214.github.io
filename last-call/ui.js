@@ -47,6 +47,34 @@ export const arr = (x) => (Array.isArray(x) ? x : []);
 export const str = (x) => (typeof x === 'string' ? x : typeof x === 'number' && Number.isFinite(x) ? String(x) : '');
 export const num = (x, fallback = null) => (typeof x === 'number' && Number.isFinite(x) ? x : fallback);
 
+// ---------- amounts: sips -> a full drink (Jackson 11/19) ----------
+// The same words as the Table (LastCallEngine.drinkAmount / drinkAmountShort).
+// Under `perDrink` it's "3 sips"; at or over it "a full drink and 3 sips",
+// "2 full drinks", or with hard liquor "a shot and 3 sips", "2 shots".
+// No `perDrink` from the Table (an older leader) = plain sips.
+
+const sipWord = (n) => (n === 1 ? '1 sip' : `${n} sips`);
+
+/** "3 sips" · "a full drink and 3 sips" · "2 shots" */
+export function drinkAmount(n, perDrink, shots) {
+  const size = Number.isFinite(perDrink) && perDrink >= 1 ? Math.floor(perDrink) : Infinity;
+  if (!(n >= size)) return sipWord(n);
+  const whole = Math.floor(n / size);
+  const rest = n % size;
+  const unit = shots ? (whole === 1 ? 'a shot' : `${whole} shots`) : whole === 1 ? 'a full drink' : `${whole} full drinks`;
+  return rest > 0 ? `${unit} and ${sipWord(rest)}` : unit;
+}
+
+/** For the Owe number and chips: "3" · "1 drink + 3" · "2 shots" */
+export function drinkAmountShort(n, perDrink, shots) {
+  const size = Number.isFinite(perDrink) && perDrink >= 1 ? Math.floor(perDrink) : Infinity;
+  if (!(n >= size)) return String(n);
+  const whole = Math.floor(n / size);
+  const rest = n % size;
+  const unit = shots ? `${whole} shot${whole === 1 ? '' : 's'}` : `${whole} drink${whole === 1 ? '' : 's'}`;
+  return rest > 0 ? `${unit} + ${rest}` : unit;
+}
+
 /** Only real CSS colors get through (keeps a bad accent from breaking the card). */
 export function safeColor(c, fallback) {
   if (typeof c !== 'string' || c.length > 40) return fallback;
@@ -95,6 +123,11 @@ export function icon(name, size = 18) {
  */
 export function longestWord(s) {
   return Math.max(1, ...str(s).split(/[\s\-–—]+/).map((w) => w.length));
+}
+
+/** plural(1, 'card') -> "1 card", plural(3, 'card') -> "3 cards" (never "1 CARDS"). */
+export function plural(n, word) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
 /** "house_party" -> "House Party" */

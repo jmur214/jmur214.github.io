@@ -6,6 +6,7 @@
 //   lc.active.<roomId>    playerId of the profile last shown
 //   lc.lastRoom           roomId of the most recent game (for visits without a #fragment)
 //   lc.wrapped.<roomId>   { <playerId>: { wrapped, name, localShowAt, receivedAt } }
+//   lc.chime              true / false: "Chime when it's my turn" (every game; on unless turned off)
 
 import { isRoomId, isSecret, isPlayerId } from './protocol.js';
 
@@ -77,6 +78,12 @@ export function getLastRoom() {
   return isRoomId(r) ? r : null;
 }
 export const setLastRoom = (roomId) => write('lc.lastRoom', roomId);
+
+// ---------- chime setting ----------
+
+/** On by default: only an explicit "off" turns it off. */
+export const getChime = () => read('lc.chime', true) !== false;
+export const setChime = (on) => write('lc.chime', !!on);
 
 // ---------- wrapped ----------
 

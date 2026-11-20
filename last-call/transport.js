@@ -7,7 +7,8 @@
 //
 // onStatus receives 'SUBSCRIBED' each time the channel is (re)joined, plus
 // 'CHANNEL_ERROR' / 'TIMED_OUT' / 'CLOSED'. Re-joins after a dropped socket fire
-// 'SUBSCRIBED' again, which is the page's cue to send `hello`.
+// 'SUBSCRIBED' again, which is the page's cue to send `hello`. A channel that fails is
+// retried with backoff until it joins or the page unsubscribes.
 
 export function createTransport(opts = {}) {
   return opts.kind === 'local' ? createLocalTransport(opts.bus) : createSupabaseTransport(opts);
@@ -27,7 +28,7 @@ function createSupabaseTransport({ supabaseUrl, supabaseKey }) {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
   });
 
-  const channels = new Map(); // name -> { channel, ready, queue }
+  const channels = new Map(); // name -> { channel, ready, queue, retryTimer, failures }
 
   function flush(entry) {
     while (entry.ready && entry.queue.length) {
@@ -35,28 +36,68 @@ function createSupabaseTransport({ supabaseUrl, supabaseKey }) {
     }
   }
 
+  // Retrying a channel that won't (re)join. supabase-js re-joins by itself after an error or
+  // a timeout, but never after the server CLOSES a channel (it just drops it). So after any
+  // failure we look again a little later: still not joined -> throw that channel away and
+  // join a fresh one. The wait doubles each time (3 s, 6 s, 12 s … up to 30 s) and starts
+  // over once it works. If supabase-js got there first, the check finds it joined and stops.
+  const RETRY_FIRST_MS = 3000;
+  const RETRY_MAX_MS = 30000;
+
+  function join(name, entry) {
+    const channel = client.channel(name, { config: { broadcast: { self: false, ack: false } } });
+    entry.channel = channel;
+    channel.on('broadcast', { event: 'm' }, (msg) => {
+      try {
+        entry.onMessage(msg && msg.payload);
+      } catch (err) {
+        console.error('[last-call] handler error', err);
+      }
+    });
+    channel.subscribe((status) => {
+      // Ignore a channel we've already replaced or left (its CLOSED comes after).
+      if (channels.get(name) !== entry || entry.channel !== channel) return;
+      entry.ready = status === 'SUBSCRIBED';
+      if (entry.ready) {
+        entry.failures = 0;
+        flush(entry);
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        scheduleRetry(name, entry);
+      }
+      if (entry.onStatus) entry.onStatus(status);
+    });
+  }
+
+  function scheduleRetry(name, entry) {
+    if (entry.retryTimer) return; // one check at a time
+    const wait = Math.min(RETRY_MAX_MS, RETRY_FIRST_MS * 2 ** entry.failures);
+    entry.failures += 1;
+    entry.retryTimer = setTimeout(async () => {
+      entry.retryTimer = null;
+      if (channels.get(name) !== entry || entry.ready) return; // left, or it came back by itself
+      const old = entry.channel;
+      entry.channel = null; // from here on, the old channel's own status updates are ignored
+      try {
+        await client.removeChannel(old);
+      } catch {
+        /* already gone */
+      }
+      if (channels.get(name) === entry && !entry.ready) join(name, entry);
+    }, wait);
+  }
+
   return {
     kind: 'supabase',
     subscribe(name, onMessage, onStatus) {
-      const channel = client.channel(name, { config: { broadcast: { self: false, ack: false } } });
-      const entry = { channel, ready: false, queue: [] };
+      const entry = { channel: null, ready: false, queue: [], retryTimer: null, failures: 0, onMessage, onStatus };
       channels.set(name, entry);
-      channel.on('broadcast', { event: 'm' }, (msg) => {
-        try {
-          onMessage(msg && msg.payload);
-        } catch (err) {
-          console.error('[last-call] handler error', err);
-        }
-      });
-      channel.subscribe((status) => {
-        entry.ready = status === 'SUBSCRIBED';
-        if (entry.ready) flush(entry);
-        if (onStatus) onStatus(status);
-      });
+      join(name, entry);
       return () => {
         channels.delete(name);
+        clearTimeout(entry.retryTimer);
+        const channel = entry.channel;
         // Give a just-queued send (e.g. `bye`) a moment to leave before we leave the channel.
-        setTimeout(() => client.removeChannel(channel), 400);
+        if (channel) setTimeout(() => client.removeChannel(channel), 400);
       };
     },
     send(name, envelope) {

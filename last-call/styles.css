@@ -2,7 +2,8 @@
    (never blurred), no gradients, labels that tilt like stickers, one chunky typeface for everything.
    Mobile-first, one-handed. Text on any colored fill is ink (#111): white text fails on the dare red.
    Tilts use the `rotate` property (not `transform`) so press/pop animations compose with them.
-   Layers (z-index): view < banner < sheet < recap < cover < modal < toast < flash. */
+   Layers (z-index): view < sheet < banner < recap < cover < modal < toast < flash.
+   (The banner sits above the prompt sheet so its "Got it" is never covered.) */
 
 /* Bricolage Grotesque, bundled (SIL OFL, fonts/OFL.txt). Variable: weight 400–800, optical size 12–96. */
 @font-face {
@@ -104,6 +105,8 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 }
 .chip.dim { background: var(--surface); color: var(--ink); }
 .chip.phase-lastcall, .chip.phase-finale { background: var(--dare); color: var(--ink); }
+/* "Last Call · 3 cards to the Finale" is long: let it wrap on small phones. */
+.chip.countdown { white-space: normal; text-align: center; border-radius: 12px; }
 
 .hero { font-size: 38px; line-height: 1.02; font-weight: 800; letter-spacing: -.015em; overflow-wrap: break-word; }
 .lead { font-size: 18px; font-weight: 600; color: var(--soft); max-width: 30ch; }
@@ -160,6 +163,29 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .name-input:focus { box-shadow: 6px 6px 0 var(--ink); }
 .notice { padding: 14px 16px; border-radius: 14px; background: var(--surface); border: var(--border); box-shadow: var(--shadow-panel); font-weight: 700; }
 .notice.bad { background: var(--dare); }
+.join-hint { display: flex; flex-direction: column; gap: 12px; }
+/* "Already playing? Moving phones": taken names, plain white (they're not new picks). */
+.moving { display: flex; flex-direction: column; gap: 12px; padding-top: 6px; }
+.moving .section-label { margin-bottom: 0; }
+.btn.name.taken, .btn.name.taken:nth-child(n) { background: var(--surface); }
+.moving > .btn.small { align-self: flex-start; }
+
+/* On/off switch ("Chime when it's my turn"): a pill track with a knob, filled when on. */
+.btn.toggle { justify-content: flex-start; gap: 12px; }
+.btn.toggle.small { gap: 8px; }
+.switch {
+  position: relative; flex: none; width: 46px; height: 28px; border-radius: 999px;
+  border: 3px solid var(--ink); background: var(--surface);
+}
+.switch::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--ink); transition: left .12s ease;
+}
+.btn.toggle.on .switch { background: var(--green); }
+.btn.toggle.on .switch::after { left: 21px; }
+.btn.toggle.small .switch { width: 38px; height: 24px; border-width: 2px; }
+.btn.toggle.small .switch::after { top: 3px; width: 14px; height: 14px; }
+.btn.toggle.small.on .switch::after { left: 17px; }
 
 /* ---------- waiting ---------- */
 
@@ -286,6 +312,8 @@ section.me:empty { display: none; }
 }
 .stat-l { font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .stat-n { font-size: 40px; line-height: 1.1; font-weight: 800; font-variant-numeric: tabular-nums; }
+/* "1 drink + 3": an Owe that reads in full drinks is words, not a number. */
+.stat-n.words { font-size: 24px; line-height: 1.2; }
 .stat.owe.hot .stat-n { color: var(--owe); }
 .stat.bank .stat-n { color: var(--bank); }
 
@@ -350,6 +378,8 @@ section.me:empty { display: none; }
 .sec-secret.peeking .sec-body { background: transparent; border: 0; box-shadow: none; padding: 0; margin: 0; }
 .sec-secret.peeking .sec-line, .sec-secret .sec-line { font-size: 18px; }
 .peek-hint { font-size: 13px; font-weight: 600; color: var(--private-muted); }
+/* A button inside a peek ("I used my thumb", or the decoy's "Got it"): white on the black look. */
+.sec-actions .btn.act { box-shadow: 4px 4px 0 var(--bg); }
 
 .actions { display: flex; flex-direction: column; gap: 14px; }
 .btn.act { width: 100%; min-height: 64px; font-size: 21px; border-radius: 18px; }
@@ -389,7 +419,7 @@ section.me:empty { display: none; }
 
 /* ---------- banner (interrupts): full-screen takeover ---------- */
 
-.layer-banner { position: relative; z-index: 20; }
+.layer-banner { position: relative; z-index: 35; }
 .banner {
   position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; gap: 22px;
   padding: calc(var(--safe-t) + 20px) calc(var(--safe-r) + 24px) calc(var(--safe-b) + 28px) calc(var(--safe-l) + 24px);
@@ -425,6 +455,14 @@ section.me:empty { display: none; }
 }
 .banner .btn:active { box-shadow: 2px 2px 0 var(--surface); }
 .banner.b-alert .btn { background: var(--bg); color: var(--ink); box-shadow: 6px 6px 0 var(--dare); }
+/* The card's countdown, repeated on the takeover (Speed Round) so it's never hidden. */
+/* A white disc with ink numbers, so it reads on every banner color (red, sky and black). */
+.banner .banner-timer {
+  margin: 0; flex: none; min-width: 84px; height: 84px; font-size: 40px;
+  background: var(--surface); color: var(--ink); border-color: var(--ink); box-shadow: 5px 5px 0 var(--ink);
+}
+.banner.b-alert .banner-timer { box-shadow: 5px 5px 0 var(--dare); }
+.banner .banner-timer.hurry { background: var(--bg); color: var(--ink); }
 .banner-strip {
   position: fixed; left: calc(var(--safe-l) + 10px); right: calc(var(--safe-r) + 10px); top: calc(var(--safe-t) + 8px);
   display: flex; gap: 10px; align-items: baseline; min-height: 48px; padding: 11px 14px; border-radius: 14px;
@@ -481,6 +519,7 @@ section.me:empty { display: none; }
 .p-state {
   align-self: flex-start; padding: 4px 12px; border-radius: 999px; border: 2px solid var(--ink);
   background: var(--green); font-weight: 800; font-size: 16px;
+  display: inline-flex; align-items: center; gap: 6px;
 }
 .p-state:empty { display: none; }
 .prompt.expired { opacity: .55; filter: grayscale(1); box-shadow: none; }
