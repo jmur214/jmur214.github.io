@@ -20,7 +20,7 @@ import {
   h, region, obj, arr, str, num, safeColor, titleCase, fmtCountdown, fmtClockTime, buzz, reducedMotion, icon, longestWord, plural,
   drinkAmount, drinkAmountShort,
 } from './ui.js';
-import { chime, unlockAudio, setChimeEnabled, holdScreenAwake } from './attention.js';
+import { chime, unlockAudio, setChimeEnabled, holdScreenAwake, audioNeedsTap, onAudioState } from './attention.js';
 import { preparePhoto, splitChunks } from './photo.js';
 
 // ============================================================================
@@ -31,7 +31,15 @@ const ROOM_STALE_MS = 15000; // no `room` for this long -> "Waiting for the Tabl
 const PING_EVERY_MS = 5000; // ...and ping this often while waiting
 const PEEK_MS = 5000; // hidden sections re-cover after this
 const RESULT_MS = 4500; // how long a prompt_close result stays up
+// A SECRET prompt's result on a shared phone waits behind "Private result · Tap to see" (11/20
+// review fix: "Alex IS the Snake." sat uncovered under whoever had the phone). It waits there until
+// its player has opened it (11/20 final review: it used to expire unseen once the phone moved on),
+// then stays this long.
+const SECRET_RESULT_MS = 20000;
 const TAP_LOCK_MS = 1000; // after a new card, its buttons ignore taps this long (a double tap can't hit them)
+// The prompt kinds this page can answer. Anything else (a newer Table's kind) is display-only:
+// "Look at the Table for this one." It never moves or holds a shared phone (11/20 final review).
+const ANSWERABLE_KINDS = ['choose', 'vote', 'tap', 'number', 'text'];
 const EXPIRED_KEEP_MS = 4000; // a timed-out prompt whose close never arrived goes away after this
 const HELLO_REPLY_MS = 10000; // the leader's reply to a `hello` has to start within this...
 const RESYNC_WINDOW_MS = 1500; // ...and its re-sent prompts arrive within this of each other
@@ -98,6 +106,10 @@ const S = {
   // itself to whoever needs it (evaluateTurn). lastKey = the need it last switched for; done =
   // needs a player has dealt with; holdUntil / force = the short pause after an answer or a press.
   turn: { lastKey: null, holdUntil: 0, force: false, done: new Set() },
+  // The phone just switched player by itself (11/20 final review): { pid, until }. Until then a
+  // full-screen "Jake's turn" catches every tap, so the last player's thumb can't press the next
+  // player's buttons.
+  handover: null,
   secretOpen: {}, // `${pid}:${promptId}` -> true: a secret prompt opened on a shared phone
   drafts: {}, // `${pid}:${promptId}` -> what's typed (kept while a secret prompt is covered)
   photo: null, // the Photo Proof sheet (openPhoto)
@@ -109,8 +121,12 @@ const S = {
   stale: false,
   priv: {}, // playerId -> `private` body
   prompts: {}, // playerId -> Map(promptId -> { p, answered, label, receivedAt })
-  results: [], // [{ pid, title, text, until }]
+  results: [], // [{ pid, title, text, secret, quiet, key, until (null = waits until seen), seenAt }]
   pressed: {}, // `${pid}:${actionId}` -> until (brief "Sent" state)
+  // Buttons pressed while the page KNOWS the Table can't hear it (11/20 final review): held here,
+  // not sent, and sent once the Table is back if that button is still offered.
+  // `${pid}:${actionId}` -> { pid, id, label }
+  queued: {},
   // { name, claimPlayerId, move, status, error, tries: [{ requestId, keyPair }], sentAt, hint }
   // status: waiting | opening | denied | expired | error. Every "Ask again" adds a try.
   joining: null,
@@ -136,6 +152,10 @@ const S = {
   chan: {}, // channel name -> its last transport status ('SUBSCRIBED', 'CHANNEL_ERROR'…)
   chime: store.getChime(), // "Chime when it's my turn"
   hiddenAt: null, // leader-clock ms the page left the screen (the Distraction Tax report)
+  // Whose camera hid the page (11/20 review fix): the page went hidden while this player's photo
+  // sheet was open, so the report goes on THEIR channel, not the phone owner's.
+  hiddenFor: null,
+  resultSeq: 0, // numbers each prompt_close result (its tap-to-see key)
 };
 
 const clock = new LeaderClock();
@@ -144,6 +164,11 @@ const mySeq = new Map(); // our own seq per channel
 const subs = new Map(); // channel name -> unsubscribe()
 let transport = null;
 let modalSeq = 0;
+// This page's own random id (11/20 review fix), sent in every hello on every player's channel.
+// Two players with the same id share this phone, so the Table never picks either of them for a
+// job whose WHO is secret (the Anonymous Ask's asker). New on every load; it's not stored.
+let pageId = null;
+const thisPage = () => pageId || (pageId = randomId(9));
 
 // ============================================================================
 // 2. Boot
@@ -159,6 +184,7 @@ function boot() {
 
   store.prune();
   setChimeEnabled(S.chime);
+  onAudioState(() => render()); // "Tap anywhere to turn the chime on" comes and goes with it
 
   if (!globalThis.crypto || !globalThis.crypto.subtle) {
     S.fatal = 'This page needs a secure (https) link. Scan the QR code again.';
@@ -190,10 +216,17 @@ function boot() {
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') resync();
+    if (document.visibilityState === 'visible') {
+      resync();
+      resendJoin(); // still waiting to be let in: the locked phone may have missed the answer
+    }
     // The page left the screen: note when (leader clock). The first hello after it comes
     // back says how long it was gone (the Table decides if that cost anything).
-    else if (S.hiddenAt == null && S.roomId && !nightOver()) S.hiddenAt = clock.leaderNow();
+    else if (S.hiddenAt == null && S.roomId && !nightOver()) {
+      S.hiddenAt = clock.leaderNow();
+      // The camera (the photo sheet's "Take the photo") is what hid it: that player's report.
+      S.hiddenFor = S.photo ? S.photo.pid : null;
+    }
   });
   window.addEventListener('pageshow', (e) => e.persisted && resync());
   window.addEventListener('hashchange', onHashChange);
@@ -260,15 +293,19 @@ function resync() {
   if (!S.roomId || !subs.size) return;
   ping();
   S.lastBeatAt = Date.now(); // the hellos below count as this round's beat
-  // Back from being hidden: how long (leader clock), on this page's FIRST session only (a
-  // phone shared with someone is the owner's). The Distraction Tax lives on the Table.
+  // Back from being hidden: how long (leader clock), on ONE session: the photographer's if their
+  // camera hid it (11/20 review fix), else this page's first (a shared phone is its owner's).
+  // The Distraction Tax lives on the Table.
   let away = null;
+  let reporter = S.sessions[0]?.playerId;
   if (S.hiddenAt != null) {
     const ms = Math.round(clock.leaderNow() - S.hiddenAt);
     if (ms >= 1000) away = { hiddenAt: Math.round(S.hiddenAt), hiddenMs: ms };
+    if (S.hiddenFor && S.sessions.some((s) => s.playerId === S.hiddenFor)) reporter = S.hiddenFor;
     S.hiddenAt = null;
+    S.hiddenFor = null;
   }
-  S.sessions.forEach((s, i) => sendHello(s.secret, i === 0 ? away : null));
+  for (const s of S.sessions) sendHello(s.secret, s.playerId === reporter ? away : null);
 }
 
 // ============================================================================
@@ -342,7 +379,7 @@ function sendHello(secret, away) {
   // `away` (Phase 2b): { hiddenAt, hiddenMs } after the page was hidden.
   const s = S.sessions.find((x) => x.secret === secret);
   if (s) S.resync[s.playerId] = { helloAt: Date.now(), start: 0, until: 0, keep: new Set() };
-  sendPrivate(secret, 'hello', { lastSeq: seqs.lastSeq(privateChannel(secret)), ...(away || {}) });
+  sendPrivate(secret, 'hello', { lastSeq: seqs.lastSeq(privateChannel(secret)), page: thisPage(), ...(away || {}) });
 }
 
 /**
@@ -352,7 +389,7 @@ function sendHello(secret, away) {
 function sendBeats() {
   S.lastBeatAt = Date.now();
   for (const s of S.sessions) {
-    sendPrivate(s.secret, 'hello', { lastSeq: seqs.lastSeq(privateChannel(s.secret)), beat: true });
+    sendPrivate(s.secret, 'hello', { lastSeq: seqs.lastSeq(privateChannel(s.secret)), beat: true, page: thisPage() });
   }
 }
 
@@ -378,6 +415,10 @@ function onRoomMessage(env) {
       S.room = body;
       S.lastRoomAt = Date.now();
       S.stale = false;
+      // Bar Crawl (11/20 final review): remember the resting line, so a page that reloads mid-walk
+      // (Safari drops the tab for Maps or Uber; the link opened again) reads as resting before any
+      // room comes, not "Can't reach the Table's phone". A room without `rest` forgets it.
+      store.setRest(S.roomId, restText());
       // Fill in names we only knew by id (per-player links).
       for (const s of S.sessions) if (!s.name) s.name = playerName(s.playerId);
       onRoomChanged(prev, body);
@@ -412,8 +453,18 @@ function onPrivateMessage(secret, env) {
       const before = actionIds(S.priv[pid]);
       const after = actionIds(body);
       if (before.length && after.length && before.join('|') !== after.join('|')) lockTaps();
+      // A new "you're up" spotlight for someone on this phone (the Snake's victim, the Polygraph
+      // subject, Collections, Settle up): chime, like a card that names them (11/20 final review:
+      // iPhones ignore the buzz, so a face-down phone stayed silent). chime() skips a second
+      // chime within 0.8 s, so a card that names them AND spotlights them chimes once.
+      const spot = str(obj(body.spotlight).text);
+      if (spot && spot !== str(obj(obj(S.priv[pid]).spotlight).text)) chime();
       S.priv[pid] = body;
       noteHelloReply(pid, 'private');
+      // The buttons this player has now. A dialog or a photo sheet for one that's gone (the card
+      // moved on) closes or says so; buttons held while the Table couldn't hear go out now.
+      dropStaleButtons(pid, after);
+      flushQueued(pid, body);
       if (str(body.name) && body.name !== session.name) {
         session.name = body.name;
         store.saveSessions(S.roomId, S.sessions);
@@ -449,9 +500,13 @@ function addPrompt(pid, p) {
   noteHelloReply(pid, 'prompt', p.id);
   if (!prev) {
     S.sheetMin = false;
-    if (pid === S.activeId) buzz(80);
+    // A hidden-who prompt (the Anonymous Ask's asker) arrives silently (11/20 review fix): a buzz
+    // or a chime the moment the card lands would point at this phone. The card itself tells
+    // everyone to look.
+    const quiet = p.hideWho === true;
+    if (pid === S.activeId && !quiet) buzz(80);
     // A new question for someone on this phone. (Quick Draw chimes when its button appears.)
-    if (str(p.kind) !== 'tap' && !isExpired(p)) chime();
+    if (str(p.kind) !== 'tap' && !isExpired(p) && !quiet) chime();
   } else if (prev.answered !== undefined && !isExpired(p)) {
     // The leader only re-sends a prompt it is STILL waiting on us for, so the answer we sent
     // never arrived (it went out while the Table's phone was reconnecting). Send it again.
@@ -495,6 +550,7 @@ function finishResync(pid) {
     // still be waiting on others: keep it until it closes or times out.
     if (e.answered !== undefined && num(e.p.endsAt) != null && !isExpired(e.p)) continue;
     map.delete(id);
+    dropDraft(pid, id);
     dropped = true;
   }
   return dropped;
@@ -544,8 +600,32 @@ function closePrompt(pid, body) {
   const map = S.prompts[pid];
   const entry = map && map.get(str(body.id));
   if (map) map.delete(str(body.id));
+  dropDraft(pid, str(body.id));
   const result = str(body.result);
-  if (result) S.results.push({ pid, title: str(entry?.p.title), text: result, until: Date.now() + RESULT_MS });
+  if (!result) return;
+  // A secret prompt's result is secret too (the leader marks it; an older leader doesn't, so the
+  // prompt's own `secret` counts as well). `quiet`: the prompt's very recipient was the secret
+  // (hideWho): a shared phone doesn't show its result at all (11/20 review fix).
+  const secret = body.secret === true || entry?.p.secret === true;
+  const quiet = entry?.p.hideWho === true;
+  // On a shared phone a secret result waits behind its player's tap until they've opened it
+  // (until: null), with a badge on their name, and only then starts its 20 s (resultSeen).
+  const waits = secret && !quiet && sharedPhone();
+  S.results.push({
+    pid, title: str(entry?.p.title), text: result, secret, quiet, key: `${str(body.id)}~${++S.resultSeq}`,
+    until: waits ? null : Date.now() + RESULT_MS, seenAt: null,
+  });
+  if (S.results.length > 30) S.results = S.results.slice(-30);
+}
+
+/** A secret result waiting, unopened, for its player on this shared phone. */
+const resultUnseen = (r) => r.until == null && !r.seenAt;
+
+/** Its player opened it: from now it stays 20 s (covered again on a switch or by Hide). */
+function resultSeen(r) {
+  if (r.seenAt) return;
+  r.seenAt = Date.now();
+  r.until = r.seenAt + SECRET_RESULT_MS;
 }
 
 function storeWrapped(session, w) {
@@ -595,15 +675,27 @@ async function sendJoinRequest(j) {
     const pub = await exportPublicKey(keyPair.publicKey);
     if (S.joining !== j) return; // cancelled meanwhile
     const requestId = randomId(9); // 12 base64url chars
-    j.tries.push({ requestId, keyPair });
-    Object.assign(j, { status: 'waiting', error: null, sentAt: Date.now(), hint: false });
     const body = { requestId, name: j.name, pub };
     if (j.claimPlayerId) body.claimPlayerId = j.claimPlayerId;
+    j.tries.push({ requestId, keyPair, body });
+    Object.assign(j, { status: 'waiting', error: null, sentAt: Date.now(), hint: false });
     sendRoom('join', body);
   } catch (err) {
     console.error(err);
     if (S.joining === j) Object.assign(j, { status: 'error', error: "This browser can't do the secure join. Try Safari or Chrome." });
   }
+}
+
+/**
+ * Back on screen while still waiting to be let in (11/20 final review): the phone may have locked
+ * and missed the one-shot `join_ok`. Send the SAME request again (same requestId, same key), so it
+ * can never add a second "Riley": today's leader ignores a requestId it has already seen; a leader
+ * that answers a handled requestId again with its join_ok lets this page in.
+ */
+function resendJoin() {
+  const j = S.joining;
+  const last = j && j.status === 'waiting' && j.tries[j.tries.length - 1];
+  if (last && last.body && S.roomId && subs.size) sendRoom('join', last.body);
 }
 
 function askAgain() {
@@ -709,7 +801,8 @@ function answer(pid, promptId, value, label, option) {
   entry.option = option;
   entry.label = label ?? String(value);
   sendPrivate(session.secret, 'answer', option ? { promptId, value, option } : { promptId, value });
-  delete S.drafts[`${pid}:${promptId}`];
+  dropDraft(pid, promptId);
+  if (isHiddenWho(entry)) toast('Sent'); // (a shared phone keeps no "Sent" box for it)
   noteTurnActivity(pid, null); // a shared phone moves on to the next person in a moment
   render();
 }
@@ -727,21 +820,93 @@ function pressAction(pid, action) {
     openPhoto(pid, action);
     return;
   }
-  const go = () => {
-    sendPrivate(session.secret, 'act', { actionId: action.id });
-    S.pressed[`${pid}:${action.id}`] = Date.now() + 1200;
-    noteTurnActivity(pid, action.id);
-    render();
-  };
+  const go = () => sendAct(pid, action.id, str(action.label));
   if (str(action.confirm)) {
     openModal({
       text: action.confirm,
+      // Whose button it asks about: if the card moves on meanwhile, the dialog closes (11/20 final review).
+      action: { pid, id: action.id },
       buttons: [
         { label: 'Cancel', style: 'ghost' },
         { label: 'Yes', style: 'primary', run: go },
       ],
     });
   } else go();
+}
+
+/** The page knows the Table can't hear it right now: no room for 15 s, or our own connection is down. */
+const tableUnreachable = () => S.stale || ownConnectionDown();
+
+/**
+ * Send a button press (`act`). While the Table can't hear us (11/20 final review: the press used
+ * to say "Sent" and was lost), it is NOT sent: the button says "Waiting for the Table…" and the
+ * press goes out once the Table is back, if that same button is still offered (flushQueued). Acts
+ * aren't safe to send twice, so it's sent exactly once, or not at all.
+ */
+function sendAct(pid, actionId, label) {
+  const session = S.sessions.find((s) => s.playerId === pid);
+  if (!session) return;
+  const key = `${pid}:${actionId}`;
+  noteTurnActivity(pid, actionId); // (a shared phone moves on either way: they've dealt with it)
+  if (tableUnreachable()) {
+    S.queued[key] = { pid, id: actionId, label };
+    toast("The Table can't hear you right now. Your tap goes through once it's back.", 3500);
+    return;
+  }
+  sendPrivate(session.secret, 'act', { actionId });
+  S.pressed[key] = Date.now() + 1200;
+  render();
+}
+
+/**
+ * A fresh `private` for this player: the Table is back. Send the presses held for them, but only
+ * a button that's still there with the same label ("I drank (3 sips)" is not "I drank (5 sips)");
+ * the rest are dropped, and the guest is told.
+ */
+function flushQueued(pid, priv) {
+  const held = Object.entries(S.queued).filter(([, q]) => q.pid === pid);
+  if (!held.length || isOffline()) return;
+  const session = S.sessions.find((s) => s.playerId === pid);
+  const offered = arr(obj(priv).actions).map(obj);
+  let sent = 0;
+  let lost = 0;
+  for (const [key, q] of held) {
+    delete S.queued[key];
+    if (session && offered.some((a) => str(a.id) === q.id && str(a.label) === q.label)) {
+      sendPrivate(session.secret, 'act', { actionId: q.id });
+      S.pressed[key] = Date.now() + 1200;
+      sent++;
+    } else lost++;
+  }
+  // (No button names in these: a press inside a peek is a secret on a shared phone.)
+  if (lost) toast("The Table's back, but the game moved on: that tap didn't count. Check your buttons.", 4000);
+  else if (sent) toast("The Table's back: your tap went through.", 2500);
+}
+
+/**
+ * The buttons this player has now (`ids`). A confirm dialog for a button that's gone closes; a
+ * photo sheet for one says "This card has moved on" and stops (11/20 final review: "Yes" sent a
+ * refusal for the last card, and a photo went to a dare the Table had skipped).
+ */
+function dropStaleButtons(pid, ids) {
+  const m = S.modal;
+  if (m && m.action && m.action.pid === pid && !ids.includes(m.action.id)) {
+    S.modal = null;
+    toast('That card has moved on.', 2500);
+  }
+  const ph = S.photo;
+  if (ph && ph.pid === pid && !ids.includes(ph.actionId) && !['sent', 'moved'].includes(ph.status)) {
+    ph.cancelled = true; // an upload in progress stops (uploadPhoto checks it)
+    if (ph.waiter) {
+      const w = ph.waiter;
+      ph.waiter = null;
+      clearTimeout(ph.waitTimer);
+      w(null);
+    }
+    ph.status = 'moved';
+    ph.prepared = null;
+    ph.error = null;
+  }
 }
 
 function openModal(m) {
@@ -752,6 +917,28 @@ function openModal(m) {
 function toast(text, ms = 1800) {
   S.toast = { text, until: Date.now() + ms };
   render();
+}
+
+// Half-written answers (11/20 final review: a mission typed out was lost when Safari reloaded the
+// tab, and pasting isn't allowed). Kept in memory and mirrored into sessionStorage (this tab only),
+// per room, player and prompt; forgotten once it's answered, closed or gone.
+function draftFor(pid, promptId) {
+  const key = `${pid}:${promptId}`;
+  if (S.drafts[key] == null) {
+    const saved = store.getDraft(S.roomId, pid, promptId);
+    if (saved) S.drafts[key] = saved;
+  }
+  return S.drafts[key] || '';
+}
+
+function saveDraft(pid, promptId, text) {
+  S.drafts[`${pid}:${promptId}`] = text;
+  store.setDraft(S.roomId, pid, promptId, text);
+}
+
+function dropDraft(pid, promptId) {
+  delete S.drafts[`${pid}:${promptId}`];
+  store.setDraft(S.roomId, pid, promptId, '');
 }
 
 // ============================================================================
@@ -791,6 +978,8 @@ function leave(pid) {
   store.saveSessions(S.roomId, S.sessions);
   delete S.priv[pid];
   delete S.prompts[pid];
+  S.results = S.results.filter((r) => r.pid !== pid);
+  for (const [k, q] of Object.entries(S.queued)) if (q.pid === pid) delete S.queued[k];
   if (S.sessions.length) setActive(S.sessions[0].playerId);
   else {
     S.activeId = null;
@@ -830,8 +1019,20 @@ const sessionName = (s) => (s && (s.name || playerName(s.playerId))) || 'Player'
 // (LastCallEngine.phoneNeeds / phoneTurn). The page still knows no game rules: it only reads
 // prompts, card.targets, spotlights and `attention` buttons.
 
-/** An open question nobody has answered yet (not a Quick Draw TAP: every player's TAP shows at once). */
-const isWaitingPrompt = (e) => e.answered === undefined && !isExpired(e.p) && str(e.p.kind) !== 'tap';
+/**
+ * An open question nobody has answered yet. Not a Quick Draw TAP (every player's TAP shows at
+ * once), and not a kind this page can't answer (display-only: it never holds the phone).
+ */
+const isWaitingPrompt = (e) =>
+  e.answered === undefined && !isExpired(e.p) && str(e.p.kind) !== 'tap' && ANSWERABLE_KINDS.includes(str(e.p.kind));
+
+/**
+ * A `hideWho` prompt on a shared phone (11/20 review fix): WHO it's for is the secret (the
+ * Anonymous Ask's asker, a deal offer's buyer). It never moves the phone, never names anyone in
+ * the header or a badge, and only shows (covered, nameless) while nothing else needs the phone.
+ */
+const isHiddenWho = (e) => e.p.hideWho === true && sharedPhone();
+const hiddenWhoWaiting = (pid) => [...(S.prompts[pid]?.values() || [])].filter((e) => isHiddenWho(e) && isWaitingPrompt(e));
 
 const waitingPrompts = (pid) =>
   [...(S.prompts[pid]?.values() || [])].filter(isWaitingPrompt).sort((a, b) => a.receivedAt - b.receivedAt);
@@ -839,6 +1040,7 @@ const waitingPrompts = (pid) =>
 /**
  * What the players on this phone need it for, most urgent first:
  *   0. a question for them (in the phone's order, oldest first: a vote asks each one in turn);
+ *      then a secret result they haven't opened yet (it waits for them, 11/20 final review);
  *   1. the card names them ({A}, then {B}, {C}), or their phone has a spotlight;
  *   2. a button marked `attention` (a charge they can still put on their tab).
  * Keys are unique per need; the phone switches when the most urgent key changes.
@@ -847,7 +1049,13 @@ function phoneNeeds() {
   const order = S.sessions.map((s) => s.playerId);
   const needs = [];
   for (const pid of order) {
-    for (const e of waitingPrompts(pid)) needs.push({ pid, rank: 0, key: `p:${pid}:${e.p.id}`, kind: str(e.p.kind) });
+    for (const e of waitingPrompts(pid)) {
+      if (isHiddenWho(e)) continue; // never moves the phone (it would name its player)
+      needs.push({ pid, rank: 0, key: `p:${pid}:${e.p.id}`, kind: str(e.p.kind), endsAt: num(e.p.endsAt) });
+    }
+  }
+  for (const pid of order) {
+    for (const r of S.results) if (r.pid === pid && resultUnseen(r)) needs.push({ pid, rank: 0, key: `r:${pid}:${r.key}` });
   }
   const card = S.room && S.room.card ? obj(S.room.card) : null;
   const targets = arr(card?.targets);
@@ -864,17 +1072,37 @@ function phoneNeeds() {
   return needs.filter((n) => !S.turn.done.has(n.key));
 }
 
-/** The player on screen is still answering something: the phone never switches away mid-answer. */
-const activeBusy = () => waitingPrompts(S.activeId).length > 0;
+/**
+ * The player on screen is still answering something, or reading a secret result they opened: the
+ * phone never switches away mid-answer (or mid-read: Hide, or its 20 s, lets it go). A hidden-who
+ * box only counts once they've opened it.
+ */
+const activeBusy = () =>
+  waitingPrompts(S.activeId).some((e) => !isHiddenWho(e) || S.secretOpen[`${S.activeId}:${e.p.id}`]) ||
+  S.results.some((r) => r.pid === S.activeId && r.secret && S.secretOpen[`${S.activeId}:result:${r.key}`]);
+
+/** Nothing on this phone needs it right now (a hidden-who box may show). */
+const phoneIdle = () => phoneNeeds().length === 0;
 
 /**
  * Hand the phone to whoever needs it (called before every render). It switches when the most
  * urgent need is new, or right after someone answered or pressed something (`force`: the next
  * voter's turn). Never away from someone mid-answer, never while a dialog or the camera sheet is
- * open, and a manual switch sticks until something new comes up.
+ * open (unless the sheet is folded away for a timed question: photoFold), and a manual switch
+ * sticks until something new comes up.
  */
 function evaluateTurn() {
-  if (!sharedPhone() || S.modal || S.photo || Date.now() < S.turn.holdUntil) return false;
+  if (!sharedPhone() || S.modal || Date.now() < S.turn.holdUntil) return false;
+  const fold = photoFold();
+  if (S.photo && fold !== 'turn') {
+    // The photo sheet is back after someone else's question: its owner's screen goes behind it.
+    if (!fold && S.photo.foldedForTurn && S.photo.pid !== S.activeId && S.sessions.some((s) => s.playerId === S.photo.pid)) {
+      setActive(S.photo.pid);
+    }
+    if (S.photo) S.photo.foldedForTurn = false;
+    return false;
+  }
+  if (S.photo) S.photo.foldedForTurn = true;
   const force = S.turn.force;
   S.turn.force = false;
   const top = phoneNeeds()[0];
@@ -884,8 +1112,20 @@ function evaluateTurn() {
   S.turn.lastKey = top.key;
   if (top.pid === S.activeId) return false;
   setActive(top.pid);
+  startHandover(top.pid);
   window.scrollTo(0, 0);
   return true;
+}
+
+/**
+ * The phone just switched player by itself (11/20 final review: Sam's thumb, a beat late, pressed
+ * Jake's "Put it on my tab", or cast Jake's anonymous vote). For a second every button is locked and
+ * a full-screen "Jake's turn" says who has the phone now, catching any tap; then it lets go. (Not
+ * over a running Quick Draw: nothing covers a TAP. The lock never touches a TAP either.)
+ */
+function startHandover(pid) {
+  lockTaps();
+  S.handover = { pid, until: S.lockUntil };
 }
 
 /**
@@ -909,12 +1149,13 @@ function noteTurnActivity(pid, actionId) {
 /** "Sam's vote" while they have a vote open, otherwise "Sam's turn". */
 function turnTitle(pid) {
   const name = sessionName(S.sessions.find((s) => s.playerId === pid));
-  return str(waitingPrompts(pid)[0]?.p.kind) === 'vote' ? `${name}'s vote` : `${name}'s turn`;
+  const first = waitingPrompts(pid).find((e) => !isHiddenWho(e));
+  return str(first?.p.kind) === 'vote' ? `${name}'s vote` : `${name}'s turn`;
 }
 
 /** A `secret` prompt on a shared phone stays behind "Sam: something private for you" until tapped. */
 const secretCovered = (pid, e) =>
-  e.p.secret === true && sharedPhone() && e.answered === undefined && !S.secretOpen[`${pid}:${e.p.id}`];
+  (e.p.secret === true || e.p.hideWho === true) && sharedPhone() && e.answered === undefined && !S.secretOpen[`${pid}:${e.p.id}`];
 
 // ============================================================================
 // 6c. Photo Proof (Jackson 11/19: "they were supposed to have to take pictures")
@@ -922,7 +1163,8 @@ const secretCovered = (pid, e) =>
 // A button marked `photo` (a photo mission's claim, a photo dare's "I did it") opens this sheet.
 // "Take the photo" opens the camera (a file input with capture); the photo is shrunk and
 // re-encoded here (photo.js: 1024 px, JPEG, no EXIF) and goes to the leader in pieces over this
-// player's own private channel (`photo_chunk`). The leader answers `photo_ack`: ok (then the
+// player's secret private channel (`photo_chunk`: plain JSON on a secret-named channel, over TLS;
+// not end-to-end encrypted). The leader answers `photo_ack`: ok (then the
 // button's `act` goes out with the `photoId`), the pieces to send again, or why it was refused.
 // No answer: everything again, up to PHOTO_ROUNDS times, then "Try again". "Send without a photo"
 // sends the plain act: the leader checks it by eye, as before. Nothing is kept on this phone.
@@ -931,9 +1173,29 @@ function openPhoto(pid, action) {
   S.photo = {
     pid, actionId: action.id, label: str(action.label) || 'Photo', text: str(action.confirm),
     status: 'pick', prepared: null, error: null, sent: 0, count: 0, photoId: null, attempt: 0,
-    early: null, waiter: null, waitTimer: null, cancelled: false,
+    early: null, waiter: null, waitTimer: null, cancelled: false, openedAt: Date.now(), foldedForTurn: false,
   };
   render();
+}
+
+/**
+ * Why the photo sheet is folded away right now, or null (it's up). The upload, if one is going,
+ * keeps going either way.
+ *   'tap'    a Quick Draw / Bank Heist is running: nothing may cover a TAP (a small strip shows);
+ *   'banner' a takeover is up (Mirror, Silent Round, the Snake's strike): it shows instead of the
+ *            sheet, and the sheet comes back after "Got it" (11/20 final review);
+ *   'turn'   a timed question came in for someone on this phone after the sheet opened (Jake's vote
+ *            while Sam lines up his shot): the phone goes to them, and the sheet comes back once
+ *            it's answered or over (11/20 final review: the vote ran out unseen under the sheet).
+ */
+function photoFold() {
+  const ph = S.photo;
+  if (!ph) return null;
+  if (hasOpenTap()) return 'tap';
+  if (currentView() === 'game' && S.room && S.room.banner && !S.bannerMin) return 'banner';
+  const late = (e) => num(e.p.endsAt) != null && e.receivedAt > ph.openedAt && !isHiddenWho(e);
+  if (S.sessions.some((s) => waitingPrompts(s.playerId).some(late))) return 'turn';
+  return null;
 }
 
 function closePhoto() {
@@ -982,12 +1244,7 @@ async function onPhotoPicked() {
 /** "Send without a photo": the plain button press (the Table checks it by eye). */
 function sendWithoutPhoto() {
   const ph = S.photo;
-  const session = ph && S.sessions.find((s) => s.playerId === ph.pid);
-  if (session) {
-    sendPrivate(session.secret, 'act', { actionId: ph.actionId });
-    S.pressed[`${ph.pid}:${ph.actionId}`] = Date.now() + 1200;
-    noteTurnActivity(ph.pid, ph.actionId);
-  }
+  if (ph) sendAct(ph.pid, ph.actionId, ph.label); // (held, like any press, while the Table can't hear)
   closePhoto();
 }
 
@@ -1121,8 +1378,16 @@ function tick() {
     }
   }
   const before = S.results.length;
-  S.results = S.results.filter((r) => r.until > now);
+  // (until null: a secret result waiting to be seen on a shared phone. If the phone isn't shared
+  // any more, it's simply on screen: start its clock.)
+  for (const r of S.results) if (r.until == null && !sharedPhone()) r.until = now + SECRET_RESULT_MS;
+  S.results = S.results.filter((r) => r.until == null || r.until > now);
   if (S.results.length !== before) dirty = true;
+  // The hand-over second is over: "Jake's turn" lifts and his buttons take taps.
+  if (S.handover && now >= S.handover.until) {
+    S.handover = null;
+    dirty = true;
+  }
   if (S.toast && S.toast.until <= now) {
     S.toast = null;
     dirty = true;
@@ -1140,12 +1405,13 @@ function tick() {
   // A prompt past its time whose prompt_close never reached us (phone locked, socket
   // dropped) would otherwise sit there forever. Give it a few seconds, then let it go.
   const leaderNow = clock.leaderNow();
-  for (const map of Object.values(S.prompts)) {
+  for (const [pid, map] of Object.entries(S.prompts)) {
     for (const [id, e] of map) {
       const ends = num(e.p.endsAt);
       if (ends == null) continue;
       if (leaderNow >= ends + EXPIRED_KEEP_MS) {
         map.delete(id);
+        dropDraft(pid, id);
         dirty = true;
       } else if (leaderNow >= ends && !e.ranOut) {
         e.ranOut = true; // just ran out: redraw once (the sheet title, the profile badges)
@@ -1215,6 +1481,7 @@ const layers = {
   view: h('div', { class: 'layer-view' }),
   banner: h('div', { class: 'layer-banner' }),
   sheet: h('div', { class: 'layer-sheet' }),
+  handover: h('div', { class: 'layer-handover' }), // "Jake's turn": the second after the phone switched
   recap: h('div', { class: 'layer-recap' }),
   photo: h('div', { class: 'layer-photo' }), // the Photo Proof sheet
   modal: h('div', { class: 'layer-modal' }),
@@ -1257,14 +1524,21 @@ function render() {
   UPDATE[view]();
   renderBanner(view);
   renderSheet(view);
+  renderHandover(view);
   renderRecap(view);
   renderPhoto(view);
   renderModal();
   region(layers.toast, S.toast?.text || null, (t) => t && h('div', { class: 'toast', text: t }));
-  // Keep the screen on while the night runs; let it sleep again at Wrapped / the end.
-  holdScreenAwake(view === 'game' && !!S.room && S.room.phase !== 'ended');
+  // Keep the screen on while the night runs; let it sleep again at Wrapped / the end, and while
+  // the game rests (Bar Crawl: walking between bars, room.rest). Also while waiting to be let in
+  // (11/20 final review: a phone that auto-locks there can miss the one-shot join_ok).
+  const waitingToJoin = view === 'join' && !!S.joining && (S.joining.status === 'waiting' || S.joining.status === 'opening');
+  holdScreenAwake((view === 'game' && !!S.room && S.room.phase !== 'ended' && !restText()) || waitingToJoin);
   updateLive();
 }
+
+/** The resting line to show while no `room` has come yet (a page reloaded mid-walk), or null. */
+const savedRest = () => (S.room ? null : store.getRest(S.roomId));
 
 // ---------- shared bits ----------
 
@@ -1276,8 +1550,17 @@ const brand = () =>
  * says whose connection it is: ours (no network, or our own channel failed) or the Table's.
  * `mine` is passed in so the caller's region() redraws when it changes.
  */
-function waitingBlock(big, mine) {
+function waitingBlock(big, mine, rest = null) {
   const finding = !S.stale && !isOffline();
+  // The game is resting on purpose (room.rest: Bar Crawl, walking between bars) and the Table's
+  // phone is asleep in a pocket: say so calmly, no alarm, no spinner.
+  if (!finding && !mine && rest) {
+    return h(
+      'div',
+      { class: big ? 'waiting big resting' : 'waiting resting', 'data-testid': 'resting', 'data-cause': 'rest' },
+      h('div', { class: 'waiting-title', text: rest }),
+    );
+  }
   let title = 'Finding the Table…';
   let sub = null;
   if (!finding && mine) {
@@ -1294,6 +1577,12 @@ function waitingBlock(big, mine) {
     h('div', { class: 'waiting-title', text: title }),
     sub && h('div', { class: 'waiting-sub', text: sub }),
   );
+}
+
+/** room.rest's line (protocol, Bar Crawl 11/20): the game is resting on purpose. null = playing. */
+function restText() {
+  const rest = obj(S.room?.rest);
+  return str(rest.text) || null;
 }
 
 /** "Chime when it's my turn": a switch. */
@@ -1349,12 +1638,17 @@ const MOUNT = {
       ticker: h('section', { class: 'ticker' }),
       foot: h('footer', { class: 'foot' }),
       phase: h('div', { class: 'phase' }),
+      // room.strip (Bar Crawl 11/20): "STOP 2 · The Owl", "ON THE MOVE", "TRANSIT ROUND".
+      strip: h('section', { class: 'strip-wrap', 'aria-live': 'polite' }),
+      // "Tap anywhere to turn the chime on" (11/20 final review): sound needs a tap on iPhones. A
+      // pill fixed above the sheet (it takes no room, so nothing moves when it goes mid-tap).
+      unlock: h('div', { class: 'unlock-wrap' }),
     };
     v.root = h(
       'main',
       { class: 'screen game' },
       h('header', { class: 'top' }, brand(), v.phase),
-      v.turn, v.profiles, v.stale, v.card, v.curses, v.me, v.priv, v.players, v.ticker, v.foot,
+      v.strip, v.turn, v.profiles, v.stale, v.card, v.curses, v.me, v.priv, v.players, v.ticker, v.foot, v.unlock,
     );
     return v;
   },
@@ -1378,10 +1672,11 @@ const UPDATE = {
       p.name !== leaderName && !S.sessions.some((s) => s.playerId === p.id));
     const mine = ownConnectionDown();
 
-    region(V.status, { stale: S.stale, room: !!room, notice: S.notice, mine, off: isOffline() }, () => [
+    const rest = room ? restText() : savedRest();
+    region(V.status, { stale: S.stale, room: !!room, notice: S.notice, mine, off: isOffline(), rest }, () => [
       S.notice && h('div', { class: 'notice', text: S.notice }),
-      !room && waitingBlock(true, mine),
-      room && (S.stale || isOffline()) && waitingBlock(false, mine),
+      !room && waitingBlock(true, mine, rest),
+      room && (S.stale || isOffline()) && waitingBlock(false, mine, rest),
     ]);
 
     const picking = S.joinMode === 'pick' && unclaimed.length > 0;
@@ -1484,6 +1779,25 @@ const UPDATE = {
       count != null && left == null && h('span', { class: 'chip dim', text: plural(count, 'card') }),
     ]);
 
+    // The status strip (protocol `room.strip`, optional): a title and a line, nothing else.
+    const strip = obj(room?.strip);
+    const stripData = str(strip.title) || str(strip.text) ? [str(strip.title), str(strip.text)] : null;
+    region(V.strip, stripData, (d) => d && h('div', { class: 'strip', 'data-testid': 'stop-strip', role: 'status' },
+      d[0] && h('b', { class: 'strip-title', text: d[0] }),
+      d[1] && h('span', { class: 'strip-text', text: d[1] })));
+    V.strip.hidden = !stripData;
+
+    // The chime is on but this page load can't make sound yet (iPhones need a tap first: after
+    // Safari reloads the tab, or the per-player link opened it). Any tap anywhere fixes it, and
+    // the pill goes (audioNeedsTap; never shown where the browser has no sound at all). Tapping
+    // the pill itself plays the chime once, as a sample.
+    const needTap = S.chime && audioNeedsTap() && !!room && room.phase !== 'ended';
+    region(V.unlock, needTap, (show) => show && h('button', {
+      class: 'unlock', type: 'button', 'data-testid': 'chime-unlock',
+      onclick: () => { unlockAudio(); chime(); },
+    }, icon('bell', 20), h('span', { text: 'Tap anywhere to turn the chime on' })));
+    V.unlock.hidden = !needTap;
+
     // Shared phone: whose turn it is, big ("Sam's vote"), then a small manual switcher whose
     // badges count what's waiting for each player.
     const needs = sharedPhone() ? phoneNeeds() : [];
@@ -1502,7 +1816,8 @@ const UPDATE = {
     // The error bar: after 15 s without the Table, or straight away when this phone is offline.
     const showBar = (S.stale || isOffline()) && !!room;
     const mine = ownConnectionDown();
-    region(V.stale, [showBar, mine], ([show, m]) => show && waitingBlock(false, m));
+    const rest = restText();
+    region(V.stale, [showBar, mine, rest], ([show, m, r]) => show && waitingBlock(false, m, r));
     V.stale.hidden = !showBar;
 
     renderCard(room, pid, priv);
@@ -1526,12 +1841,14 @@ const UPDATE = {
     const owe = num(you.owe, num(pub.owe, 0));
     const bank = num(you.bank, num(pub.bank, 0));
     const oweText = drinkAmountShort(owe, perDrink, shots);
-    region(V.me, [sessionName(me), owe, oweText, bank], ([name, o, ot, b]) => [
+    const meter = you.drink ?? null; // 11/20 economy #3 (see drinkMeterLine below)
+    region(V.me, [sessionName(me), owe, oweText, bank, meter], ([name, o, ot, b, m]) => [
       h('div', { class: 'me-name' }, h('span', { class: 'dim', text: 'You are' }), h('b', { text: name })),
       h('div', { class: 'me-stats' },
         h('div', { class: `stat owe${o > 0 ? ' hot' : ''}`, 'data-testid': 'owe' }, h('span', { class: 'stat-l', text: 'Owe' }),
           h('span', { class: `stat-n${ot !== String(o) ? ' words' : ''}`, text: ot })),
         h('div', { class: 'stat bank', 'data-testid': 'bank' }, h('span', { class: 'stat-l', text: 'Bank' }), h('span', { class: 'stat-n', text: String(b) }))),
+      drinkMeterLine(m),
     ]);
 
     // Private sections + actions
@@ -1551,7 +1868,8 @@ const UPDATE = {
     const actions = allActions.filter((a) => !homeOf(a));
     const pressed = allActions.filter((a) => S.pressed[`${pid}:${a.id}`] > now).map((a) => a.id);
     const locked = tapsLocked();
-    region(V.priv, [pid, sections, peeked, allActions, pressed, locked], () => [
+    const held = allActions.filter((a) => S.queued[`${pid}:${a.id}`]).map((a) => a.id); // (actionButton reads S.queued)
+    region(V.priv, [pid, sections, peeked, allActions, pressed, locked, held], () => [
       sections.length > 0 && h('div', { class: 'sections' }, sections.map((s) =>
         renderSection(pid, s, peeked.includes(s.id), allActions.filter((a) => homeOf(a) === s.id), pressed, locked))),
       actions.length > 0 && h('div', { class: 'actions' }, actions.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false))),
@@ -1602,6 +1920,27 @@ const UPDATE = {
   },
 };
 
+// ---------- "This drink: 7 of 10 sips" (11/20 economy review #3) ----------
+// Every sip drunk tonight counts toward the next full drink (the Table's "Sips per drink"),
+// and a full drink rolls over, so a pile of teeny sips still adds up to a glass. The leader
+// sends it as the OPTIONAL `private.you.drink` ({ sips, of, drinks, shots?, text }); an older
+// leader sends none and nothing shows. Its "I drank a full drink" button (`drank:one`) is an
+// ordinary action, so it needs nothing here.
+
+/** The line under Owe / Bank from `private.you.drink`: the words, and a thin bar for how
+ *  far into this drink. Anything missing or malformed: nothing (null). */
+function drinkMeterLine(drink) {
+  const d = obj(drink);
+  const text = str(d.text);
+  if (!text) return null;
+  const of = Math.max(1, num(d.of, 10));
+  const pct = Math.max(0, Math.min(100, Math.round((num(d.sips, 0) / of) * 100)));
+  return h('div', { class: 'drink-meter', 'data-testid': 'drink-meter' },
+    h('span', { class: 'drink-meter-text', text }),
+    h('span', { class: 'drink-meter-bar', 'aria-hidden': 'true' },
+      h('span', { class: 'drink-meter-fill', style: { width: `${pct}%` } })));
+}
+
 // ---------- the big card ----------
 
 function currentSpotlight(room, pid, priv) {
@@ -1637,9 +1976,11 @@ function renderCard(room, pid, priv) {
       taxText: num(card.chickenTax) != null ? drinkAmount(num(card.chickenTax), num(room?.sipsPerDrink), room?.hardLiquor === true) : null,
     },
     spot: spot && spot.text, name: spot ? sessionName(activeSession()) : '',
+    // No room yet: whose connection it is, and the resting line kept from before a reload.
+    mine: !room && ownConnectionDown(), rest: room ? null : savedRest(),
   };
   region(V.card, data, (d) => {
-    if (!d.has) return waitingBlock(true, false);
+    if (!d.has) return waitingBlock(true, d.mine, d.rest);
     if (!d.card) {
       // No card up (an interrupt, the Finale): a spotlight still shows (e.g. "THE SNAKE
       // STRUCK YOU", "Settle up: drink 3 sips").
@@ -1701,16 +2042,22 @@ function flash(color) {
 
 // ---------- private sections ----------
 
-/** One action button. `inPeek`: it sits inside a peeking section, so its tap mustn't also re-cover it. */
+/**
+ * One action button. `inPeek`: it sits inside a peeking section, so its tap mustn't also re-cover it.
+ * Pressed while the Table couldn't hear it: "Waiting for the Table…" until it goes (sendAct).
+ */
 function actionButton(pid, a, sent, locked, inPeek) {
   const style = ACTION_STYLES.includes(a.style) ? a.style : 'normal';
+  const held = !sent && !!S.queued[`${pid}:${a.id}`];
   return h('button', {
-    class: `btn act ${style}${sent ? ' sent' : ''}`, 'data-action': a.id, disabled: sent || locked,
+    class: `btn act ${style}${sent ? ' sent' : ''}${held ? ' held' : ''}`, 'data-action': a.id, disabled: sent || locked || held,
+    'data-state': held ? 'held' : sent ? 'sent' : null,
     onclick: (e) => {
       if (inPeek) e.stopPropagation();
       pressAction(pid, a);
     },
-  }, sent ? [icon('check', 22), 'Sent'] : a.photo === true ? [icon('camera', 22), a.label] : a.label);
+  }, sent ? [icon('check', 22), 'Sent'] : held ? [icon('clock', 22), 'Waiting for the Table…']
+    : a.photo === true ? [icon('camera', 22), a.label] : a.label);
 }
 
 /**
@@ -1770,15 +2117,24 @@ function renderBanner(view) {
   // Quick Draw: nothing may cover the TAP button mid-race, so the banner folds into the strip.
   if (b && !S.bannerMin && hasOpenTap()) S.bannerMin = true;
   // A running card clock also shows on the takeover: nobody pays for a timer they couldn't see.
+  // Phase 3 (protocol: banner.endsAt / banner.meter, optional): a banner can carry its own
+  // countdown (the Silent Round's minute) and a live level ("quiet" / "loud"). Neither is in
+  // the banner's key, so a meter update never replays the takeover or its buzz.
   const card = S.room?.card;
-  const ends = b && cardTimerRunning(card) ? cardTimerEnds(card) : null;
+  const own = b ? num(b.endsAt) : null;
+  const ends = b && cardTimerRunning(card) ? cardTimerEnds(card) : own;
+  const meter = b && (b.meter === 'loud' || b.meter === 'quiet') ? b.meter : null;
   const style = b && BANNER_STYLES.includes(b.style) ? b.style : 'info';
-  region(layers.banner, b && [style, str(b.title), str(b.text), S.bannerMin, ends], (d) => {
+  const meterEl = (m) => m && h('span', { class: `banner-meter m-${m}`, 'data-testid': 'banner-meter', role: 'status',
+    'aria-label': m === 'loud' ? 'Loud' : 'Quiet', text: m === 'loud' ? 'LOUD!' : 'QUIET' });
+  region(layers.banner, b && [style, str(b.title), str(b.text), S.bannerMin, ends, meter], (d) => {
     if (!d) return [];
-    const [st, title, text, min, endsAt] = d;
+    const [st, title, text, min, endsAt, level] = d;
     if (min) {
       return h('button', { class: `banner-strip b-${st}`, onclick: () => { S.bannerMin = false; render(); } },
-        h('b', { text: title || 'Heads up' }), text && h('span', { text }));
+        h('b', { text: title || 'Heads up' }), text && h('span', { text }),
+        endsAt != null && h('span', { class: 'timer strip-timer', 'data-testid': 'strip-timer', 'data-ends-at': String(endsAt), 'aria-label': 'seconds left' }),
+        meterEl(level));
     }
     // Full-screen takeover: chip, tilted title sticker, the one-line rule, one huge button.
     return h('div', { class: `banner b-${st}`, role: 'alert', 'data-testid': 'banner' },
@@ -1788,9 +2144,28 @@ function renderBanner(view) {
       title && h('div', { class: 'banner-sticker' },
         h('div', { class: 'banner-title', style: { '--fit': String(longestWord(title)) }, text: title })),
       text && h('div', { class: 'banner-text', text }),
-      endsAt != null && h('span', { class: 'timer banner-timer', 'data-testid': 'banner-timer', 'data-ends-at': String(endsAt), 'aria-label': 'seconds left' }),
+      (endsAt != null || level) && h('div', { class: 'banner-live' },
+        endsAt != null && h('span', { class: 'timer banner-timer', 'data-testid': 'banner-timer', 'data-ends-at': String(endsAt), 'aria-label': 'seconds left' }),
+        meterEl(level)),
       h('button', { class: 'btn ghost', text: 'Got it', onclick: () => { S.bannerMin = true; render(); } }));
   });
+}
+
+/**
+ * The hand-over (startHandover): for a second after the phone switched player by itself, a
+ * full-screen "On this phone now: Jake's turn" sits over the screen and the prompt sheet and
+ * swallows every tap. It names only who has the phone (the header says it too). Never over a
+ * running Quick Draw (nothing covers a TAP), and under a banner takeover.
+ */
+function renderHandover(view) {
+  const ho = view === 'game' && S.handover && sharedPhone() && !hasOpenTap() ? S.handover : null;
+  region(layers.handover, ho ? [ho.pid, turnTitle(ho.pid)] : null, (d) => d && h('div', {
+    class: 'handover', 'data-testid': 'handover', 'aria-hidden': 'true',
+    // Catch the tap: it was meant for the last player's button.
+    onclick: (e) => { e.preventDefault(); e.stopPropagation(); },
+  }, h('div', { class: 'handover-card' },
+    h('span', { class: 'handover-label', text: 'On this phone now' }),
+    h('b', { class: 'handover-name', style: { '--fit': String(longestWord(d[1])) }, text: d[1] }))));
 }
 
 /** Someone on this phone has a Quick Draw (tap) prompt still running. */
@@ -1811,8 +2186,19 @@ function renderSheet(view) {
   // The player on screen: all their prompts. Anyone else on this phone: only a running Quick
   // Draw TAP (a race can't wait for the phone to come round), labelled with their name.
   const items = [];
+  const idle = show && sharedPhone() && phoneIdle();
   if (show) {
-    for (const e of S.prompts[pid]?.values() || []) items.push({ owner: pid, e });
+    for (const e of S.prompts[pid]?.values() || []) {
+      // A hidden-who box: only while nothing else needs the phone; once answered, gone (its
+      // "Sent" would point at its player).
+      if (isHiddenWho(e) && (!idle || e.answered !== undefined)) continue;
+      items.push({ owner: pid, e });
+    }
+    // Someone ELSE on this phone has a hidden-who box waiting (and the phone is idle): the same
+    // nameless covered box here too, so no screen stands out (like the Thumb Master's decoy).
+    if (idle && !hiddenWhoWaiting(pid).length && S.sessions.some((s) => s.playerId !== pid && hiddenWhoWaiting(s.playerId).length)) {
+      items.push({ owner: pid, e: { p: { id: '__quiet', kind: 'quiet', hideWho: true, secret: true }, decoy: true, receivedAt: 0 } });
+    }
     for (const s of S.sessions) {
       if (s.playerId === pid) continue;
       for (const e of S.prompts[s.playerId]?.values() || []) {
@@ -1821,8 +2207,9 @@ function renderSheet(view) {
     }
     items.sort((a, b) => b.e.receivedAt - a.e.receivedAt);
   }
-  const entries = items.filter((x) => x.owner === pid).map((x) => x.e);
-  const results = show ? S.results.filter((r) => r.pid === pid) : [];
+  const entries = items.filter((x) => x.owner === pid && !x.e.decoy).map((x) => x.e);
+  // Results: a hidden-who prompt's never shows on a shared phone; a secret one waits behind a tap.
+  const results = show ? S.results.filter((r) => r.pid === pid && !(r.quiet && sharedPhone())) : [];
 
   let sheet = layers.sheet.firstElementChild;
   if (!sheet) {
@@ -1831,35 +2218,71 @@ function renderSheet(view) {
       h('div', { class: 'sheet-results' }),
       h('div', { class: 'sheet-list' }));
     layers.sheet.append(sheet);
+    // The page leaves room under its foot for the sheet's real height (11/20 final review: with a
+    // vote and a bet open, "Leave game" and the chime switch sat under the sheet, unreachable).
+    if (typeof ResizeObserver === 'function') {
+      new ResizeObserver(() => {
+        document.documentElement.style.setProperty('--sheet-h', `${sheet.hidden ? 0 : sheet.offsetHeight}px`);
+      }).observe(sheet);
+    }
   }
   const [head, resultsEl, list] = sheet.children;
   sheet.hidden = !items.length && !results.length;
   sheet.classList.toggle('min', S.sheetMin && items.length > 0);
 
-  const open = entries.filter((e) => e.answered === undefined && !isExpired(e.p)).length;
+  const live = (e) => e.answered === undefined && !isExpired(e.p);
+  const open = entries.filter((e) => live(e) && ANSWERABLE_KINDS.includes(str(e.p.kind))).length;
+  // A kind this page can't answer (a newer Table's): it only says "Look at the Table for this one".
+  const lookOnly = entries.some((e) => live(e) && !ANSWERABLE_KINDS.includes(str(e.p.kind)));
   const sent = entries.some((e) => e.answered !== undefined);
+  // Only a hidden-who box (real or decoy) on the sheet: the same neutral title on every screen.
+  const quietOnly = items.length > 0 && items.every((x) => x.e.decoy || isHiddenWho(x.e));
   // On a shared phone the sheet says whose it is, big: "Sam's vote".
-  const whose = sharedPhone() && open > 0 ? turnTitle(pid) : null;
-  region(head, [items.length, open, sent, S.sheetMin, whose], ([n, o, any, min, w]) => n === 0 ? [] : [
+  const whose = sharedPhone() && open > 0 && !quietOnly ? turnTitle(pid) : null;
+  region(head, [items.length, open, sent, S.sheetMin, whose, quietOnly, lookOnly], ([n, o, any, min, w, q, look]) => n === 0 ? [] : [
     // "Sent" only if something was really answered; a prompt that just ran out says so.
     h('span', {
       class: `sheet-title${w ? ' whose' : ''}`, 'data-testid': 'sheet-title',
-      text: w || (o > 0 ? `Your move${o > 1 ? ` · ${o}` : ''}` : any ? 'Sent' : n > entries.length ? 'Quick Draw' : "Time's up"),
+      text: q ? 'Something private' : w || (o > 0 ? `Your move${o > 1 ? ` · ${o}` : ''}` : any ? 'Sent'
+        : look ? 'Look at the Table' : n > entries.length ? 'Quick Draw' : "Time's up"),
     }),
     h('button', { class: 'btn ghost small', text: min ? 'Show' : 'Hide', onclick: () => { S.sheetMin = !S.sheetMin; render(); } }),
   ]);
-  region(resultsEl, results.map((r) => [r.title, r.text]), (rs) =>
-    rs.map(([title, text]) => h('div', { class: 'result', 'data-testid': 'prompt-result' },
-      title && h('div', { class: 'result-title', text: title }), h('div', { class: 'result-text', text }))));
+  const resultRows = results.map((r) => {
+    const k = `${pid}:result:${r.key}`;
+    return [r.title, r.text, r.secret && sharedPhone() ? (S.secretOpen[k] ? 'open' : 'covered') : 'plain', k];
+  });
+  region(resultsEl, resultRows, (rs) =>
+    rs.map(([title, text, look, k]) => {
+      if (look === 'covered') {
+        // Nothing about it shows (not even the question's title) until its player taps. Its 20 s
+        // only start then: until it's opened once it waits (11/20 final review).
+        return h('button', {
+          class: 'result secret-result', type: 'button', 'data-testid': 'prompt-result', 'data-secret': 'covered',
+          onclick: () => {
+            S.secretOpen[k] = true;
+            const r = S.results.find((x) => `${pid}:result:${x.key}` === k);
+            if (r) resultSeen(r);
+            render();
+          },
+        }, icon('eye', 22), h('span', { class: 'result-text', text: 'Private result · Tap to see' }));
+      }
+      return h('div', { class: `result${look === 'open' ? ' secret-result open' : ''}`, 'data-testid': 'prompt-result' },
+        title && h('div', { class: 'result-title', text: title }), h('div', { class: 'result-text', text }),
+        look === 'open' && h('button', {
+          class: 'btn hide-secret', type: 'button', 'data-testid': 'result-hide', text: 'Hide',
+          onclick: () => { delete S.secretOpen[k]; render(); },
+        }));
+    }));
 
   // Keyed reconciliation: reuse existing elements; never detach the one being typed in.
   const wanted = new Set();
   items.forEach(({ owner, e }, i) => {
     const key = `${owner}:${e.p.id}`;
     wanted.add(key);
-    const covered = secretCovered(owner, e);
+    const covered = e.decoy || secretCovered(owner, e);
     const named = sharedPhone() && str(e.p.kind) === 'tap';
-    const sig = JSON.stringify([e.p, e.answered, e.label, covered, named, sharedPhone()]);
+    const sig = JSON.stringify([e.p, e.answered, e.label, covered, named, sharedPhone(), !!e.decoy]);
     let el = promptEls.get(key);
     if (!el || el._sig !== sig) {
       const fresh = buildPrompt(owner, e, { covered, named });
@@ -1909,22 +2332,28 @@ function buildPrompt(pid, entry, opts = {}) {
   // A secret prompt (a mission being written, a sealed bid, a Showdown stake…) on a shared
   // phone: nothing about it shows until its player taps it open. Its clock still runs.
   if (opts.covered) {
-    const covered = h('section', { class: 'prompt secret-covered', 'data-prompt': p.id, 'data-pid': pid, 'data-secret': 'covered' },
-      h('button', {
-        class: 'secret-open', type: 'button', 'data-testid': 'secret-open',
-        onclick: () => { S.secretOpen[key] = true; render(); },
-      }, icon('eye', 30),
-      h('span', { class: 'peek-text', text: `${who}: something private for you` }),
-      h('span', { class: 'peek-sub', text: 'Tap to open' })),
-      timer);
+    // A hidden-who box (and its decoy on everyone else's screen) says no name, and shows no clock.
+    const quiet = p.hideWho === true;
+    const open = entry.decoy
+      ? () => toast("Not for you. Whoever it's for: switch to your name, then tap it.", 3000)
+      : () => { S.secretOpen[key] = true; render(); };
+    const covered = h('section', {
+      class: 'prompt secret-covered', 'data-prompt': entry.decoy ? null : p.id, 'data-pid': pid, 'data-secret': 'covered',
+      'data-quiet': quiet ? '1' : null,
+    },
+      h('button', { class: 'secret-open', type: 'button', 'data-testid': 'secret-open', onclick: open }, icon('eye', 30),
+        h('span', { class: 'peek-text', text: quiet ? 'Something private for someone on this phone' : `${who}: something private for you` }),
+        h('span', { class: 'peek-sub', text: 'Tap to open' })),
+      !quiet && timer);
     if (num(p.endsAt) != null) covered.dataset.expires = String(p.endsAt);
     return covered;
   }
-  const secret = p.secret === true;
-  // Answered and secret: just "Sent" (what was typed or bid never sits on screen).
+  const secret = p.secret === true || p.hideWho === true; // (hideWho always comes with secret)
+  // Answered and secret: just "Sent" (what was typed or bid never sits on screen). On a shared
+  // phone not even its title (11/20 review fix: "Strike: who's on the next card?" said it all).
   if (secret && answered) {
     return h('section', { class: 'prompt answered secret-sent', 'data-prompt': p.id, 'data-pid': pid, 'data-kind': kind },
-      h('div', { class: 'p-head' }, h('h3', { class: 'p-title', text: str(p.title) || 'Quick question' })),
+      !sharedPhone() && h('div', { class: 'p-head' }, h('h3', { class: 'p-title', text: str(p.title) || 'Quick question' })),
       h('div', { class: 'p-state', 'data-testid': 'secret-sent' }, 'Sent', icon('check', 16)));
   }
   // Anonymous vote: never echo the name back ("Sent: Alex" sat on screen for 20 s).
@@ -1981,7 +2410,8 @@ function buildPrompt(pid, entry, opts = {}) {
     let min = num(p.min, 0);
     let max = num(p.max, min + 10);
     if (max < min) [min, max] = [max, min];
-    const step = num(p.step, 1) > 0 ? p.step : 1;
+    const s = num(p.step, 1); // (`step` is optional: an absent one used to give "NaN", 11/20 final review)
+    const step = s > 0 ? s : 1;
     const clamp = (v) => Math.min(max, Math.max(min, Math.round((v - min) / step) * step + min));
     let value = answered && typeof entry.answered === 'number' ? entry.answered : clamp(num(p.default, min));
     const out = h('output', { class: 'num-val', text: String(value) });
@@ -2014,7 +2444,7 @@ function buildPrompt(pid, entry, opts = {}) {
       autocomplete: 'off', 'aria-label': str(p.title) || 'Your answer',
     });
     if (answered) ta.value = String(entry.answered);
-    else if (S.drafts[key]) ta.value = S.drafts[key]; // typed before it was covered
+    else ta.value = draftFor(pid, p.id); // typed before it was covered, or before the tab reloaded
     const count = h('span', { class: 'count', text: `${ta.value.length}/${maxLength}` });
     // A text prompt with `options` has one send button per option ("Save it" / "Save: needs a
     // photo"); the one tapped goes along as `option`. Otherwise a single Send.
@@ -2041,7 +2471,7 @@ function buildPrompt(pid, entry, opts = {}) {
       if (/^insertFrom(Paste|Drop|PasteAsQuotation|Yank)/.test(e.inputType || '')) block(e);
     });
     ta.addEventListener('input', refresh);
-    ta.addEventListener('input', () => { S.drafts[key] = ta.value; });
+    ta.addEventListener('input', () => saveDraft(pid, p.id, ta.value));
     sends.forEach((b, i) => b.addEventListener('click', () => {
       const v = ta.value.trim();
       if (v) answer(pid, p.id, v, v, sendOpts[i] ? sendOpts[i].id : undefined);
@@ -2067,7 +2497,10 @@ function buildPrompt(pid, entry, opts = {}) {
         class: 'btn ghost small p-act', type: 'button', 'data-prompt-action': a.id, text: a.label,
         onclick: () => {
           const session = S.sessions.find((x) => x.playerId === pid);
-          if (session) sendPrivate(session.secret, 'act', { actionId: a.id });
+          if (!session) return;
+          // (Not held for later like a card button: it only helps with this open question.)
+          if (tableUnreachable()) toast("The Table can't hear you right now. Try again once it's back.", 3000);
+          else sendPrivate(session.secret, 'act', { actionId: a.id });
         },
       }))));
   }
@@ -2120,9 +2553,22 @@ function renderRecap(view) {
 /** The photo sheet: take it, check it, send it (with progress), or say why it didn't go. */
 function renderPhoto(view) {
   const ph = view === 'game' ? S.photo : null;
-  const data = ph && [ph.pid, ph.status, ph.sent, ph.count, ph.checking === true, ph.error, ph.attempt, ph.label, ph.text];
+  // Folded away (photoFold): during a Quick Draw / Bank Heist (11/20 review fix: the sheet sat over
+  // the TAP and the no-show was charged) and for a timed question that came in meanwhile (11/20
+  // final review), as a small strip at the top; under a fresh takeover (11/20 final review: the
+  // Mirror pose fired under the sheet) not at all, the takeover is the screen. The upload keeps
+  // going, and the sheet comes back once the race / question / takeover is over.
+  const fold = ph ? photoFold() : null;
+  const data = ph && [ph.pid, ph.status, ph.sent, ph.count, ph.checking === true, ph.error, ph.attempt, ph.label, ph.text, fold];
   region(photoBox, data, () => {
     if (!ph) return [];
+    if (fold === 'banner') return [];
+    if (fold) {
+      const after = fold === 'tap' ? 'Waiting for you after the race' : 'Back after this question';
+      const what = ph.status === 'sending' ? `Sending… ${ph.sent} of ${ph.count}` : ph.status === 'sent' ? 'Sent to the Table' : after;
+      return h('div', { class: 'photo-strip', role: 'status', 'data-testid': 'photo-strip', 'data-fold': fold },
+        icon('camera', 18), h('b', { text: 'Photo proof' }), h('span', { text: what }));
+    }
     const who = sharedPhone() ? sessionName(S.sessions.find((s) => s.playerId === ph.pid)) : '';
     const preview = ph.prepared && h('img', { class: 'photo-preview', 'data-testid': 'photo-preview', src: ph.prepared.dataUrl, alt: 'Your photo' });
     const cancel = h('button', { class: 'btn ghost', type: 'button', 'data-testid': 'photo-cancel', text: 'Cancel', onclick: closePhoto });
@@ -2153,6 +2599,13 @@ function renderPhoto(view) {
       ];
     } else if (ph.status === 'sent') {
       body = [preview, h('div', { class: 'p-state photo-done', 'data-testid': 'photo-sent' }, icon('check', 18), 'Sent to the Table')];
+    } else if (ph.status === 'moved') {
+      // The Table took this button away meanwhile (the dare was skipped, the card moved on):
+      // nothing more goes out for it (11/20 final review).
+      body = [
+        h('div', { class: 'notice bad', 'data-testid': 'photo-moved', text: "This card has moved on, so the photo didn't go." }),
+        h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'photo-close', text: 'Close', onclick: closePhoto }),
+      ];
     } else {
       body = [
         preview,

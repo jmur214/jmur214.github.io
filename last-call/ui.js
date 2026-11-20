@@ -100,6 +100,8 @@ const ICONS = {
   userPlus: ['M15 20a6 6 0 0 0-12 0', 'M9 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z', 'M19 8v6', 'M16 11h6'],
   exit: ['M10 4H5v16h5', 'M14 8l4 4-4 4', 'M18 12H9'],
   camera: ['M3.5 8h3.5l2-3h6l2 3h3.5v11h-17z', 'M12 10a3.5 3.5 0 1 0 0 7 3.5 3.5 0 1 0 0-7z'],
+  bell: ['M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z', 'M10 20.5a2.2 2.2 0 0 0 4 0'],
+  clock: ['M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 1 0 0-17z', 'M12 7.5V12l3 2'],
 };
 
 /** icon('eye', 20) -> a decorative <svg> (aria-hidden; the button's text is its label). */

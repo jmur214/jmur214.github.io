@@ -7,9 +7,11 @@
 //                          size, its SHA-256 (base64url) and a data: URL for the preview.
 //   splitChunks(b64)    -> the base64 in pieces small enough for one Realtime message each.
 //
-// The photo goes ONLY to the leader's phone, over this player's own encrypted private channel
-// (protocol: `photo_chunk` / `photo_ack`). Nothing is uploaded anywhere else, and nothing is
-// saved on this phone.
+// The photo goes ONLY to the leader's phone, over this player's secret private channel
+// (protocol: `photo_chunk` / `photo_ack`): plain JSON on a channel whose name is an unguessable
+// secret handed over in the sealed join, sent over TLS. It is NOT end-to-end encrypted, and the
+// relay (Supabase Realtime broadcast) stores nothing. Nothing is uploaded anywhere else, and
+// nothing is saved on this phone.
 
 export const PHOTO_MAX_SIDE = 1024;
 export const PHOTO_QUALITY = 0.7;

@@ -15,6 +15,7 @@
 let enabled = true;
 let ctx = null; // the AudioContext, created on the first tap
 let lastChimeAt = 0;
+let stateListener = null; // app.js redraws when sound becomes possible (or stops being possible)
 
 const CHIME_GAP_MS = 800; // two reasons at once (named on the card + a vote) = one chime
 
@@ -23,14 +24,48 @@ export function setChimeEnabled(on) {
   enabled = !!on;
 }
 
+let noAudio = false; // this browser has no Web Audio, or making it failed: a tap won't help
+
+/**
+ * Should the page ask for a tap? The chime is on, this browser can make sound, and right now it
+ * can't: before the first tap on this page load (iOS), and again while iOS keeps the audio paused
+ * (after the phone was locked). The page shows "Tap anywhere to turn the chime on" while it's true
+ * (11/20 final review: after Safari reloaded the tab, the chime was silently dead until the guest
+ * happened to tap).
+ */
+export function audioNeedsTap() {
+  if (!enabled || noAudio) return false;
+  if (!(globalThis.AudioContext || globalThis.webkitAudioContext)) return false;
+  return !ctx || ctx.state !== 'running';
+}
+
+/** `fn()` runs whenever audioReady() may have changed. */
+export function onAudioState(fn) {
+  stateListener = fn;
+}
+
+function audioChanged() {
+  if (stateListener) {
+    try {
+      stateListener();
+    } catch {
+      /* the page's redraw failed: nothing to do here */
+    }
+  }
+}
+
 function audioContext() {
   if (ctx) return ctx;
   const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
   if (!AC) return null;
   try {
     ctx = new AC();
+    // iOS pauses ("interrupted" / "suspended") and resumes it by itself: tell the page.
+    if (typeof ctx.addEventListener === 'function') ctx.addEventListener('statechange', audioChanged);
   } catch {
     ctx = null;
+    noAudio = true;
+    audioChanged();
   }
   return ctx;
 }
@@ -41,7 +76,7 @@ export function unlockAudio() {
   const c = audioContext();
   if (!c) return;
   try {
-    if (c.state !== 'running') c.resume().catch(() => {});
+    if (c.state !== 'running') c.resume().then(audioChanged, () => {});
     // One silent sample, played inside the tap: iOS treats the page as allowed to play sound.
     const silent = c.createBuffer(1, 1, 22050);
     const src = c.createBufferSource();
@@ -164,5 +199,6 @@ for (const type of ['pointerdown', 'touchend', 'click', 'keydown']) {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   acquire(true);
-  if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+  if (ctx && ctx.state !== 'running') ctx.resume().then(audioChanged, () => {});
+  audioChanged(); // (still paused? the page asks for a tap again)
 });
