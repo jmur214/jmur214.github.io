@@ -402,7 +402,7 @@ function addPrompt(pid, p) {
   const map = S.prompts[pid] || (S.prompts[pid] = new Map());
   const prev = map.get(p.id);
   // A re-send (after hello) keeps what we already answered and its place in the stack.
-  map.set(p.id, { p, answered: prev?.answered, label: prev?.label, receivedAt: prev?.receivedAt || Date.now() });
+  map.set(p.id, { p, answered: prev?.answered, option: prev?.option, label: prev?.label, receivedAt: prev?.receivedAt || Date.now() });
   noteHelloReply(pid, 'prompt', p.id);
   if (!prev) {
     S.sheetMin = false;
@@ -414,7 +414,8 @@ function addPrompt(pid, p) {
     // never arrived (it went out while the Table's phone was reconnecting). Send it again.
     // A copy that does arrive twice is harmless: the leader keeps the first answer only.
     const session = S.sessions.find((s) => s.playerId === pid);
-    if (session) sendPrivate(session.secret, 'answer', { promptId: p.id, value: prev.answered });
+    const body = prev.option ? { promptId: p.id, value: prev.answered, option: prev.option } : { promptId: p.id, value: prev.answered };
+    if (session) sendPrivate(session.secret, 'answer', body);
   }
 }
 
@@ -652,14 +653,19 @@ function isExpired(p) {
   return ends != null && clock.leaderNow() >= ends;
 }
 
-function answer(pid, promptId, value, label) {
+/**
+ * Answer a prompt. `option`: which send button on a text prompt with options (e.g. "Save it" /
+ * "Save: needs a photo"); it rides along as `option` in the answer.
+ */
+function answer(pid, promptId, value, label, option) {
   const entry = S.prompts[pid]?.get(promptId);
   const session = S.sessions.find((s) => s.playerId === pid);
   if (!entry || !session || entry.answered !== undefined || isExpired(entry.p)) return;
   if (isLockable(entry.p) && tapsLocked()) return; // a new card just landed (double-tap guard)
   entry.answered = value;
+  entry.option = option;
   entry.label = label ?? String(value);
-  sendPrivate(session.secret, 'answer', { promptId, value });
+  sendPrivate(session.secret, 'answer', option ? { promptId, value, option } : { promptId, value });
   render();
 }
 
@@ -1296,12 +1302,21 @@ function renderCard(room, pid, priv, covered) {
   region(V.card, data, (d) => {
     if (!d.has) return waitingBlock(true, false);
     if (!d.card) {
-      return h('div', { class: 'card idle' },
+      // No card up (an interrupt, the Finale): a spotlight still shows (e.g. "THE SNAKE
+      // STRUCK YOU", "Settle up: drink 3 sips").
+      const idle = h('div', { class: 'card idle' },
         h('div', { class: 'card-band' }, h('span', { class: 'card-kind', text: PHASES[d.phase] || titleCase(d.phase) || 'Last Call' })),
         h('div', { class: 'card-idle-body' },
           h('p', { class: 'card-text', text: d.ended ? "That's a wrap. Thanks for playing!" : 'Eyes on the Table.' }),
           d.ended && d.hasRecap && h('button', { class: 'btn primary', text: 'See your recap', onclick: () => { S.recap = pid; render(); } }),
           !d.ended && d.leader && h('p', { class: 'card-sub', text: `${d.leader} is running the game.` })));
+      if (!d.spot) return idle;
+      return [
+        h('div', { class: 'spot', 'data-testid': 'spotlight' },
+          h('span', { class: 'spot-head', text: `Heads up, ${d.name}!` }),
+          h('span', { class: 'spot-text', text: d.spot })),
+        idle,
+      ];
     }
     const c = d.card;
     const len = c.text.length;
@@ -1490,6 +1505,9 @@ function renderSheet(view) {
     if (!el || el._sig !== sig) {
       const fresh = buildPrompt(pid, e);
       fresh._sig = sig;
+      // The same prompt came again with something new (e.g. its ideas arrived): keep what
+      // was typed, and the cursor, so nobody loses a half-written mission.
+      if (el) keepTyping(el, fresh);
       if (el) el.replaceWith(fresh);
       el = fresh;
       promptEls.set(key, el);
@@ -1501,6 +1519,22 @@ function renderSheet(view) {
       el.remove();
       promptEls.delete(key);
     }
+  }
+}
+
+/** Carry a text box's value, focus and cursor from an old prompt element to its rebuild. */
+function keepTyping(oldEl, freshEl) {
+  const before = oldEl.querySelector('textarea');
+  const after = freshEl.querySelector('textarea');
+  if (!before || !after || after.value || !before.value) return;
+  after.value = before.value;
+  after.dispatchEvent(new Event('input'));
+  if (document.activeElement === before) {
+    const [a, b] = [before.selectionStart, before.selectionEnd];
+    queueMicrotask(() => {
+      after.focus();
+      try { after.setSelectionRange(a, b); } catch { /* ignore */ }
+    });
   }
 }
 
@@ -1576,10 +1610,18 @@ function buildPrompt(pid, entry) {
     });
     if (answered) ta.value = String(entry.answered);
     const count = h('span', { class: 'count', text: `${ta.value.length}/${maxLength}` });
-    const go = h('button', { class: 'btn primary', 'data-testid': 'send-text', text: 'Send', disabled: !ta.value.trim() });
+    // A text prompt with `options` has one send button per option ("Save it" / "Save: needs a
+    // photo"); the one tapped goes along as `option`. Otherwise a single Send.
+    const sendOpts = arr(p.options).map(obj).filter((o) => str(o.id));
+    const sends = sendOpts.length
+      ? sendOpts.map((o, i) => h('button', {
+        class: `btn ${i === 0 ? 'primary' : 'normal'} send-opt`, 'data-send-option': o.id,
+        text: str(o.label) || o.id, disabled: !ta.value.trim(),
+      }))
+      : [h('button', { class: 'btn primary', 'data-testid': 'send-text', text: 'Send', disabled: !ta.value.trim() })];
     const refresh = () => {
       count.textContent = `${ta.value.length}/${maxLength}`;
-      go.disabled = !ta.value.trim();
+      for (const b of sends) b.disabled = !ta.value.trim();
     };
     // No pasting, no dropping: you type every word yourself (his design).
     const block = (e) => {
@@ -1593,10 +1635,34 @@ function buildPrompt(pid, entry) {
       if (/^insertFrom(Paste|Drop|PasteAsQuotation|Yank)/.test(e.inputType || '')) block(e);
     });
     ta.addEventListener('input', refresh);
-    go.addEventListener('click', () => ta.value.trim() && send(ta.value.trim(), ta.value.trim()));
-    fs.append(ta, h('div', { class: 'text-row' }, count, go));
+    sends.forEach((b, i) => b.addEventListener('click', () => {
+      const v = ta.value.trim();
+      if (v) answer(pid, p.id, v, v, sendOpts[i] ? sendOpts[i].id : undefined);
+    }));
+    fs.append(ta, sendOpts.length
+      ? h('div', { class: 'text-row multi' }, count, h('div', { class: 'send-opts' }, sends))
+      : h('div', { class: 'text-row' }, count, sends[0]));
   } else {
     fs.append(h('p', { class: 'dim', text: 'Look at the Table for this one.' }));
+  }
+  // Read-only notes (e.g. "Help me think of one" ideas): plain text you can read but not tap,
+  // select or copy into the box. You still type your own.
+  const notes = arr(p.notes).map(str).filter(Boolean);
+  if (notes.length) {
+    el.append(h('div', { class: 'p-notes', 'data-testid': 'prompt-notes', 'aria-label': 'Ideas (read only)' },
+      notes.map((n, i) => h('p', { class: i === 0 ? 'p-note-head' : 'p-note', text: n }))));
+  }
+  // Buttons inside the prompt that press an ordinary action without answering it.
+  const inner = arr(p.actions).map(obj).filter((a) => str(a.id) && str(a.label));
+  if (inner.length && !answered) {
+    el.append(h('div', { class: 'p-actions' }, inner.map((a) =>
+      h('button', {
+        class: 'btn ghost small p-act', type: 'button', 'data-prompt-action': a.id, text: a.label,
+        onclick: () => {
+          const session = S.sessions.find((x) => x.playerId === pid);
+          if (session) sendPrivate(session.secret, 'act', { actionId: a.id });
+        },
+      }))));
   }
   return el;
 }
