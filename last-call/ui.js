@@ -99,6 +99,7 @@ const ICONS = {
   back: ['M19 12H5', 'M11 6l-6 6 6 6'],
   userPlus: ['M15 20a6 6 0 0 0-12 0', 'M9 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z', 'M19 8v6', 'M16 11h6'],
   exit: ['M10 4H5v16h5', 'M14 8l4 4-4 4', 'M18 12H9'],
+  camera: ['M3.5 8h3.5l2-3h6l2 3h3.5v11h-17z', 'M12 10a3.5 3.5 0 1 0 0 7 3.5 3.5 0 1 0 0-7z'],
 };
 
 /** icon('eye', 20) -> a decorative <svg> (aria-hidden; the button's text is its label). */

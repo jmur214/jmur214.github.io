@@ -21,6 +21,7 @@ import {
   drinkAmount, drinkAmountShort,
 } from './ui.js';
 import { chime, unlockAudio, setChimeEnabled, holdScreenAwake } from './attention.js';
+import { preparePhoto, splitChunks } from './photo.js';
 
 // ============================================================================
 // 1. State
@@ -43,6 +44,15 @@ const JOIN_EXPIRE_MS = 5 * 60000;
 // for 45 s counts as away on the leader's side: votes stop waiting for it, Quick Draw won't
 // charge it.
 const BEAT_MS = 15000;
+// Shared phones (11/19): after someone on this phone answers or presses a button, wait this long
+// before the phone switches to the next person (so "Sent" shows, and a prompt the button opens
+// can arrive first).
+const TURN_HOLD_MS = 1000;
+// Photo Proof (11/19): the pause between photo pieces (Realtime rate limits), how long to wait
+// for the Table's answer, and how many rounds before it says "didn't send".
+const PHOTO_PACE_MS = 70;
+const PHOTO_ACK_MS = 6000;
+const PHOTO_ROUNDS = 4;
 
 // Thumb Master is a secret: only the holder gets the hidden "thumb" section. A black box on
 // one phone only gives the holder away across the table, so while the power is live EVERY
@@ -56,6 +66,17 @@ const DECOY_THUMB = {
   id: THUMB_SECTION, hidden: true, style: 'secret', decoy: true, title: 'Not you this time',
   lines: ['Someone else is the Thumb Master.', 'When a thumb goes down on the table, copy it fast.', 'The last one to copy drinks.'],
 };
+// The decoy goes exactly where the real box sits (11/19 Phase 2b review: it used to go FIRST,
+// while the holder's real box comes after the role and mission boxes, so where the box was could
+// give the holder away). The engine puts the real "thumb" box just before these sections (or at
+// the end): LastCallEngine.sections(for:) / withThumbDecoy.
+const THUMB_COMES_BEFORE = ['cursed', 'debt', 'firesale'];
+function withThumbDecoy(sections) {
+  const at = sections.findIndex((s) => THUMB_COMES_BEFORE.includes(s.id));
+  const out = [...sections];
+  out.splice(at < 0 ? out.length : at, 0, DECOY_THUMB);
+  return out;
+}
 
 // Card band color when the leader sends no (or a bad) `card.accent`: Sticker Pop "game" teal.
 const DEFAULT_ACCENT = '#2ec4b6';
@@ -73,7 +94,13 @@ const S = {
   roomId: null,
   sessions: [], // [{ roomId, secret, playerId, name, savedAt }]
   activeId: null, // playerId of the profile on screen
-  cover: false, // "Pass to X" cover is up
+  // Shared phones (11/19): no whole-screen "Pass to Sam" cover any more. The phone switches by
+  // itself to whoever needs it (evaluateTurn). lastKey = the need it last switched for; done =
+  // needs a player has dealt with; holdUntil / force = the short pause after an answer or a press.
+  turn: { lastKey: null, holdUntil: 0, force: false, done: new Set() },
+  secretOpen: {}, // `${pid}:${promptId}` -> true: a secret prompt opened on a shared phone
+  drafts: {}, // `${pid}:${promptId}` -> what's typed (kept while a secret prompt is covered)
+  photo: null, // the Photo Proof sheet (openPhoto)
   room: null, // last public `room` body
   lastRoomAt: 0,
   enteredAt: 0,
@@ -108,6 +135,7 @@ const S = {
   resync: {}, // playerId -> { helloAt, start, until, keep: Set } while matching a hello's reply
   chan: {}, // channel name -> its last transport status ('SUBSCRIBED', 'CHANNEL_ERROR'…)
   chime: store.getChime(), // "Chime when it's my turn"
+  hiddenAt: null, // leader-clock ms the page left the screen (the Distraction Tax report)
 };
 
 const clock = new LeaderClock();
@@ -153,7 +181,7 @@ function boot() {
 
     const saved = frag.p || store.getActive(roomId);
     S.activeId = (S.sessions.find((s) => s.playerId === saved) || S.sessions[0] || {}).playerId || null;
-    S.cover = S.sessions.length > 1; // shared phone: never open straight onto someone's secrets
+    // (A shared phone opens on whoever needs it: evaluateTurn. Secrets stay behind their own taps.)
 
     // A stored recap and no fresh per-player link -> the game is (probably) over: open on it.
     S.showWrappedLanding = Object.keys(S.wrapped).length > 0 && !frag.s;
@@ -163,6 +191,9 @@ function boot() {
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') resync();
+    // The page left the screen: note when (leader clock). The first hello after it comes
+    // back says how long it was gone (the Table decides if that cost anything).
+    else if (S.hiddenAt == null && S.roomId && !nightOver()) S.hiddenAt = clock.leaderNow();
   });
   window.addEventListener('pageshow', (e) => e.persisted && resync());
   window.addEventListener('hashchange', onHashChange);
@@ -194,7 +225,7 @@ function onHashChange() {
   const known = S.sessions.some((s) => s.playerId === frag.p && s.secret === frag.s);
   adoptLinkSession(frag.s, frag.p);
   subscribePrivate(S.sessions.find((s) => s.playerId === frag.p));
-  if (!known || S.activeId !== frag.p) setActive(frag.p, S.sessions.length > 1);
+  if (!known || S.activeId !== frag.p) setActive(frag.p);
   S.showWrappedLanding = false;
   S.addingPlayer = false;
   render();
@@ -229,7 +260,15 @@ function resync() {
   if (!S.roomId || !subs.size) return;
   ping();
   S.lastBeatAt = Date.now(); // the hellos below count as this round's beat
-  for (const s of S.sessions) sendHello(s.secret);
+  // Back from being hidden: how long (leader clock), on this page's FIRST session only (a
+  // phone shared with someone is the owner's). The Distraction Tax lives on the Table.
+  let away = null;
+  if (S.hiddenAt != null) {
+    const ms = Math.round(clock.leaderNow() - S.hiddenAt);
+    if (ms >= 1000) away = { hiddenAt: Math.round(S.hiddenAt), hiddenMs: ms };
+    S.hiddenAt = null;
+  }
+  S.sessions.forEach((s, i) => sendHello(s.secret, i === 0 ? away : null));
 }
 
 // ============================================================================
@@ -297,12 +336,13 @@ function ping() {
   sendRoom('ping', {});
 }
 
-function sendHello(secret) {
+function sendHello(secret, away) {
   // The leader answers a hello with `private`, then every prompt it is still waiting on this
   // player for. Note when we asked, so that reply can be matched (see noteHelloReply).
+  // `away` (Phase 2b): { hiddenAt, hiddenMs } after the page was hidden.
   const s = S.sessions.find((x) => x.secret === secret);
   if (s) S.resync[s.playerId] = { helloAt: Date.now(), start: 0, until: 0, keep: new Set() };
-  sendPrivate(secret, 'hello', { lastSeq: seqs.lastSeq(privateChannel(secret)) });
+  sendPrivate(secret, 'hello', { lastSeq: seqs.lastSeq(privateChannel(secret)), ...(away || {}) });
 }
 
 /**
@@ -389,6 +429,9 @@ function onPrivateMessage(secret, env) {
     case 'wrapped':
       storeWrapped(session, body);
       break;
+    case 'photo_ack':
+      photoAck(pid, body); // Photo Proof: the Table has the photo (or wants pieces again)
+      break;
     default:
       return;
   }
@@ -406,7 +449,7 @@ function addPrompt(pid, p) {
   noteHelloReply(pid, 'prompt', p.id);
   if (!prev) {
     S.sheetMin = false;
-    if (pid === S.activeId && !S.cover) buzz(80);
+    if (pid === S.activeId) buzz(80);
     // A new question for someone on this phone. (Quick Draw chimes when its button appears.)
     if (str(p.kind) !== 'tap' && !isExpired(p)) chime();
   } else if (prev.answered !== undefined && !isExpired(p)) {
@@ -479,7 +522,7 @@ function onRoomChanged(prev, room) {
   S.cardId = cardId;
   if (newCard) {
     lockTaps();
-    if (currentView() === 'game' && !S.cover) window.scrollTo(0, 0);
+    if (currentView() === 'game') window.scrollTo(0, 0);
     const targets = arr(card?.targets);
     if (S.sessions.some((s) => targets.includes(s.playerId))) chime(); // {A}/{B}/{C} is on this phone
   }
@@ -515,7 +558,7 @@ function storeWrapped(session, w) {
   };
   S.wrapped[session.playerId] = rec;
   store.saveWrapped(S.roomId, session.playerId, rec);
-  if (session.playerId === S.activeId && !S.cover) S.recap = session.playerId;
+  if (session.playerId === S.activeId) S.recap = session.playerId;
   else S.unseenRecap.add(session.playerId);
 }
 
@@ -627,7 +670,7 @@ async function onJoinOk(body) {
     } else S.sessions.push(session);
     store.saveSessions(S.roomId, S.sessions);
     store.setLastRoom(S.roomId);
-    setActive(playerId, S.sessions.length > 1);
+    setActive(playerId);
     subscribePrivate(existing || session);
   } catch (err) {
     console.error(err);
@@ -666,6 +709,8 @@ function answer(pid, promptId, value, label, option) {
   entry.option = option;
   entry.label = label ?? String(value);
   sendPrivate(session.secret, 'answer', option ? { promptId, value, option } : { promptId, value });
+  delete S.drafts[`${pid}:${promptId}`];
+  noteTurnActivity(pid, null); // a shared phone moves on to the next person in a moment
   render();
 }
 
@@ -677,9 +722,15 @@ const tapsLocked = () => Date.now() < S.lockUntil;
 function pressAction(pid, action) {
   const session = S.sessions.find((s) => s.playerId === pid);
   if (!session || tapsLocked()) return;
+  // Photo Proof: a photo button opens the camera sheet first (its text is the "are you sure").
+  if (action.photo === true) {
+    openPhoto(pid, action);
+    return;
+  }
   const go = () => {
     sendPrivate(session.secret, 'act', { actionId: action.id });
     S.pressed[`${pid}:${action.id}`] = Date.now() + 1200;
+    noteTurnActivity(pid, action.id);
     render();
   };
   if (str(action.confirm)) {
@@ -707,25 +758,27 @@ function toast(text, ms = 1800) {
 // 6. Sessions & profiles (one page, several players)
 // ============================================================================
 
-function setActive(pid, withCover) {
+/**
+ * Another player has the phone now. Every secret covers itself again (peeks and opened secret
+ * prompts are per player and get cleared), and the last player's recap closes.
+ */
+function setActive(pid) {
   S.activeId = pid;
-  S.cover = !!withCover;
+  S.peek = {};
+  S.secretOpen = {};
+  S.recap = null;
   S.flashedKey = null;
+  if (S.unseenRecap.has(pid)) {
+    S.unseenRecap.delete(pid);
+    S.recap = pid;
+  }
   store.setActive(S.roomId, pid);
 }
 
+/** A chip in the small switcher: a manual switch (it sticks until something new needs the phone). */
 function switchTo(pid) {
   if (pid === S.activeId) return;
-  setActive(pid, true);
-  render();
-}
-
-function uncover() {
-  S.cover = false;
-  if (S.unseenRecap.has(S.activeId)) {
-    S.unseenRecap.delete(S.activeId);
-    S.recap = S.activeId;
-  }
+  setActive(pid);
   render();
 }
 
@@ -738,10 +791,9 @@ function leave(pid) {
   store.saveSessions(S.roomId, S.sessions);
   delete S.priv[pid];
   delete S.prompts[pid];
-  if (S.sessions.length) setActive(S.sessions[0].playerId, true);
+  if (S.sessions.length) setActive(S.sessions[0].playerId);
   else {
     S.activeId = null;
-    S.cover = false;
     S.notice = 'You left the game. To jump back in, tap "Already playing? Moving phones" and pick your name.';
   }
   render();
@@ -762,8 +814,279 @@ function confirmLeave() {
 }
 
 const activeSession = () => S.sessions.find((s) => s.playerId === S.activeId) || null;
+const sharedPhone = () => S.sessions.length > 1;
 const playerName = (id) => str(arr(S.room?.players).find((p) => obj(p).id === id)?.name);
 const sessionName = (s) => (s && (s.name || playerName(s.playerId))) || 'Player';
+
+// ============================================================================
+// 6b. Shared phones: who has the phone (Jackson 11/19)
+// ============================================================================
+// "if people are sharing phones, it should just auto switch. we don't need to tap to reveal each
+// time, just keep the sensative info hidden and only have to tap to reveal that". So there's no
+// whole-screen "Pass to Sam" cover: public things (the card, Owe / Bank, banners, curses, their
+// public role, Drank it / Put it on my tab, Did it / Refuse, votes) show straight away for whoever
+// has the phone; each secret sits behind its own tap (hidden sections; prompts marked `secret`);
+// and the phone switches by itself to whoever needs it. Same rules as the leader's "My stuff"
+// (LastCallEngine.phoneNeeds / phoneTurn). The page still knows no game rules: it only reads
+// prompts, card.targets, spotlights and `attention` buttons.
+
+/** An open question nobody has answered yet (not a Quick Draw TAP: every player's TAP shows at once). */
+const isWaitingPrompt = (e) => e.answered === undefined && !isExpired(e.p) && str(e.p.kind) !== 'tap';
+
+const waitingPrompts = (pid) =>
+  [...(S.prompts[pid]?.values() || [])].filter(isWaitingPrompt).sort((a, b) => a.receivedAt - b.receivedAt);
+
+/**
+ * What the players on this phone need it for, most urgent first:
+ *   0. a question for them (in the phone's order, oldest first: a vote asks each one in turn);
+ *   1. the card names them ({A}, then {B}, {C}), or their phone has a spotlight;
+ *   2. a button marked `attention` (a charge they can still put on their tab).
+ * Keys are unique per need; the phone switches when the most urgent key changes.
+ */
+function phoneNeeds() {
+  const order = S.sessions.map((s) => s.playerId);
+  const needs = [];
+  for (const pid of order) {
+    for (const e of waitingPrompts(pid)) needs.push({ pid, rank: 0, key: `p:${pid}:${e.p.id}`, kind: str(e.p.kind) });
+  }
+  const card = S.room && S.room.card ? obj(S.room.card) : null;
+  const targets = arr(card?.targets);
+  for (const t of targets) if (order.includes(t)) needs.push({ pid: t, rank: 1, key: `c:${str(card.id)}:${t}` });
+  for (const pid of order) {
+    const spot = obj(obj(S.priv[pid]).spotlight);
+    if (!targets.includes(pid) && str(spot.text)) needs.push({ pid, rank: 1, key: `s:${pid}:${str(spot.text)}` });
+  }
+  for (const pid of order) {
+    for (const a of arr(obj(S.priv[pid]).actions).map(obj)) {
+      if (a.attention === true && str(a.id)) needs.push({ pid, rank: 2, key: `a:${pid}:${a.id}` });
+    }
+  }
+  return needs.filter((n) => !S.turn.done.has(n.key));
+}
+
+/** The player on screen is still answering something: the phone never switches away mid-answer. */
+const activeBusy = () => waitingPrompts(S.activeId).length > 0;
+
+/**
+ * Hand the phone to whoever needs it (called before every render). It switches when the most
+ * urgent need is new, or right after someone answered or pressed something (`force`: the next
+ * voter's turn). Never away from someone mid-answer, never while a dialog or the camera sheet is
+ * open, and a manual switch sticks until something new comes up.
+ */
+function evaluateTurn() {
+  if (!sharedPhone() || S.modal || S.photo || Date.now() < S.turn.holdUntil) return false;
+  const force = S.turn.force;
+  S.turn.force = false;
+  const top = phoneNeeds()[0];
+  if (!top) return false;
+  if (activeBusy() && top.pid !== S.activeId) return false;
+  if (!force && top.key === S.turn.lastKey) return false;
+  S.turn.lastKey = top.key;
+  if (top.pid === S.activeId) return false;
+  setActive(top.pid);
+  window.scrollTo(0, 0);
+  return true;
+}
+
+/**
+ * Someone on this phone answered (actionId null) or pressed a button: pause a moment, then hand
+ * the phone on. A press also counts as dealing with their spotlight, their card (a `card:`
+ * button) or that button's own `attention`.
+ */
+function noteTurnActivity(pid, actionId) {
+  S.turn.holdUntil = Date.now() + TURN_HOLD_MS;
+  S.turn.force = true;
+  if (actionId == null) return;
+  for (const n of phoneNeeds()) {
+    if (n.pid !== pid || n.rank === 0) continue;
+    if (n.key.startsWith('s:') || (n.key.startsWith('c:') && actionId.startsWith('card:')) || n.key === `a:${pid}:${actionId}`) {
+      S.turn.done.add(n.key);
+    }
+  }
+  if (S.turn.done.size > 300) S.turn.done = new Set([...S.turn.done].slice(-100));
+}
+
+/** "Sam's vote" while they have a vote open, otherwise "Sam's turn". */
+function turnTitle(pid) {
+  const name = sessionName(S.sessions.find((s) => s.playerId === pid));
+  return str(waitingPrompts(pid)[0]?.p.kind) === 'vote' ? `${name}'s vote` : `${name}'s turn`;
+}
+
+/** A `secret` prompt on a shared phone stays behind "Sam: something private for you" until tapped. */
+const secretCovered = (pid, e) =>
+  e.p.secret === true && sharedPhone() && e.answered === undefined && !S.secretOpen[`${pid}:${e.p.id}`];
+
+// ============================================================================
+// 6c. Photo Proof (Jackson 11/19: "they were supposed to have to take pictures")
+// ============================================================================
+// A button marked `photo` (a photo mission's claim, a photo dare's "I did it") opens this sheet.
+// "Take the photo" opens the camera (a file input with capture); the photo is shrunk and
+// re-encoded here (photo.js: 1024 px, JPEG, no EXIF) and goes to the leader in pieces over this
+// player's own private channel (`photo_chunk`). The leader answers `photo_ack`: ok (then the
+// button's `act` goes out with the `photoId`), the pieces to send again, or why it was refused.
+// No answer: everything again, up to PHOTO_ROUNDS times, then "Try again". "Send without a photo"
+// sends the plain act: the leader checks it by eye, as before. Nothing is kept on this phone.
+
+function openPhoto(pid, action) {
+  S.photo = {
+    pid, actionId: action.id, label: str(action.label) || 'Photo', text: str(action.confirm),
+    status: 'pick', prepared: null, error: null, sent: 0, count: 0, photoId: null, attempt: 0,
+    early: null, waiter: null, waitTimer: null, cancelled: false,
+  };
+  render();
+}
+
+function closePhoto() {
+  const ph = S.photo;
+  if (ph) {
+    ph.cancelled = true;
+    if (ph.waiter) {
+      const w = ph.waiter;
+      ph.waiter = null;
+      clearTimeout(ph.waitTimer);
+      w(null);
+    }
+  }
+  S.photo = null;
+  render();
+}
+
+/** "Take the photo": the camera (or the photo picker, on a phone without one). */
+function takePhoto() {
+  photoInput.value = '';
+  photoInput.click();
+}
+
+async function onPhotoPicked() {
+  const ph = S.photo;
+  const file = photoInput.files && photoInput.files[0];
+  if (!ph || !file) return;
+  ph.status = 'preparing';
+  ph.error = null;
+  render();
+  try {
+    const prepared = await preparePhoto(file);
+    if (S.photo !== ph) return;
+    ph.prepared = prepared;
+    ph.status = 'preview';
+  } catch (err) {
+    console.error(err);
+    if (S.photo !== ph) return;
+    ph.prepared = null;
+    ph.status = 'failed';
+    ph.error = "Couldn't open that photo. Take it again.";
+  }
+  render();
+}
+
+/** "Send without a photo": the plain button press (the Table checks it by eye). */
+function sendWithoutPhoto() {
+  const ph = S.photo;
+  const session = ph && S.sessions.find((s) => s.playerId === ph.pid);
+  if (session) {
+    sendPrivate(session.secret, 'act', { actionId: ph.actionId });
+    S.pressed[`${ph.pid}:${ph.actionId}`] = Date.now() + 1200;
+    noteTurnActivity(ph.pid, ph.actionId);
+  }
+  closePhoto();
+}
+
+/** "Send it" / "Try again": upload the prepared photo, then press the button with its id. */
+async function sendPhoto() {
+  const ph = S.photo;
+  const session = ph && S.sessions.find((s) => s.playerId === ph.pid);
+  if (!ph || !ph.prepared || !session || ph.status === 'sending') return;
+  ph.photoId = randomId(9); // a fresh id every try: a half-sent one is just abandoned
+  ph.attempt += 1;
+  ph.status = 'sending';
+  ph.error = null;
+  ph.early = null;
+  const chunks = splitChunks(ph.prepared.b64);
+  ph.count = chunks.length;
+  ph.sent = 0;
+  render();
+  const result = await uploadPhoto(ph, session, chunks);
+  if (S.photo !== ph || ph.cancelled) return;
+  if (result.ok) {
+    ph.status = 'sent';
+    sendPrivate(session.secret, 'act', { actionId: ph.actionId, photoId: ph.photoId });
+    S.pressed[`${ph.pid}:${ph.actionId}`] = Date.now() + 1200;
+    noteTurnActivity(ph.pid, ph.actionId);
+    render();
+    setTimeout(() => {
+      if (S.photo === ph) {
+        S.photo = null;
+        render();
+      }
+    }, 1200);
+  } else {
+    ph.status = 'failed';
+    ph.error = result.reason || "It didn't reach the Table. Check your signal, then try again.";
+    render();
+  }
+}
+
+/**
+ * Send every piece (paced), wait for the Table's answer, and send again what it says is
+ * missing (or everything, if it said nothing). Resolves { ok } or { ok: false, reason }.
+ */
+async function uploadPhoto(ph, session, chunks) {
+  const base = { photoId: ph.photoId, count: chunks.length, hash: ph.prepared.hash, bytes: ph.prepared.bytes, mime: 'image/jpeg' };
+  let todo = chunks.map((_, i) => i);
+  for (let round = 0; round < PHOTO_ROUNDS; round++) {
+    for (const i of todo) {
+      if (S.photo !== ph || ph.cancelled) return { ok: false };
+      sendPrivate(session.secret, 'photo_chunk', { ...base, index: i, data: chunks[i] });
+      if (round === 0) {
+        ph.sent = i + 1;
+        render();
+      }
+      await new Promise((r) => setTimeout(r, PHOTO_PACE_MS));
+    }
+    ph.sent = chunks.length;
+    ph.checking = true;
+    render();
+    const ack = await waitPhotoAck(ph, PHOTO_ACK_MS);
+    ph.checking = false;
+    if (S.photo !== ph || ph.cancelled) return { ok: false };
+    if (ack && ack.ok === true) return { ok: true };
+    if (ack && str(ack.reason)) return { ok: false, reason: str(ack.reason) };
+    const missing = ack ? arr(ack.missing).filter((i) => Number.isInteger(i) && i >= 0 && i < chunks.length) : [];
+    todo = missing.length ? [...new Set(missing)] : chunks.map((_, i) => i);
+  }
+  return { ok: false };
+}
+
+/** The Table's next `photo_ack` for this photo (one that came early is used at once), or null. */
+function waitPhotoAck(ph, ms) {
+  if (ph.early) {
+    const a = ph.early;
+    ph.early = null;
+    return Promise.resolve(a);
+  }
+  return new Promise((resolve) => {
+    ph.waiter = resolve;
+    ph.waitTimer = setTimeout(() => {
+      if (ph.waiter === resolve) {
+        ph.waiter = null;
+        resolve(null);
+      }
+    }, ms);
+  });
+}
+
+function photoAck(pid, body) {
+  const ph = S.photo;
+  if (!ph || ph.pid !== pid || !ph.photoId || str(body.photoId) !== ph.photoId) return;
+  if (ph.waiter) {
+    const w = ph.waiter;
+    ph.waiter = null;
+    clearTimeout(ph.waitTimer);
+    w(body);
+  } else if (body.ok === true || !ph.early) {
+    ph.early = body; // arrived mid-round: used as soon as the round ends
+  }
+}
 
 // ============================================================================
 // 7. Live ticker: countdowns, arming, waiting-for-the-Table, expiries
@@ -802,6 +1125,11 @@ function tick() {
   if (S.results.length !== before) dirty = true;
   if (S.toast && S.toast.until <= now) {
     S.toast = null;
+    dirty = true;
+  }
+  // Shared phones: the short pause after an answer is over: let evaluateTurn hand the phone on.
+  if (S.turn.holdUntil && now >= S.turn.holdUntil) {
+    S.turn.holdUntil = 0;
     dirty = true;
   }
   // The double-tap lock is over: unlock the buttons.
@@ -888,12 +1216,21 @@ const layers = {
   banner: h('div', { class: 'layer-banner' }),
   sheet: h('div', { class: 'layer-sheet' }),
   recap: h('div', { class: 'layer-recap' }),
-  cover: h('div', { class: 'layer-cover' }),
+  photo: h('div', { class: 'layer-photo' }), // the Photo Proof sheet
   modal: h('div', { class: 'layer-modal' }),
   toast: h('div', { class: 'layer-toast', role: 'status', 'aria-live': 'polite' }),
   flash: h('div', { class: 'flash', 'aria-hidden': 'true' }),
 };
 root.replaceChildren(...Object.values(layers));
+// The Photo Proof sheet: a region for the sheet, plus the one camera input (kept in the page, so
+// iPhones open the camera from it).
+const photoBox = h('div', { class: 'photo-box' });
+const photoInput = h('input', {
+  type: 'file', accept: 'image/*', capture: 'environment', hidden: true, tabindex: '-1', 'aria-hidden': 'true',
+  'data-testid': 'photo-input',
+});
+photoInput.addEventListener('change', onPhotoPicked);
+layers.photo.append(photoBox, photoInput);
 
 let mountedView = null;
 let V = {}; // the current view's region elements
@@ -908,6 +1245,8 @@ function currentView() {
 
 function render() {
   const view = currentView();
+  // Shared phones: hand the phone to whoever needs it before drawing (11/19).
+  if (view === 'game') evaluateTurn();
   if (view !== mountedView) {
     mountedView = view;
     V = MOUNT[view]();
@@ -919,10 +1258,9 @@ function render() {
   renderBanner(view);
   renderSheet(view);
   renderRecap(view);
-  renderCover(view);
+  renderPhoto(view);
   renderModal();
   region(layers.toast, S.toast?.text || null, (t) => t && h('div', { class: 'toast', text: t }));
-  document.body.classList.toggle('has-cover', view === 'game' && S.cover);
   // Keep the screen on while the night runs; let it sleep again at Wrapped / the end.
   holdScreenAwake(view === 'game' && !!S.room && S.room.phase !== 'ended');
   updateLive();
@@ -1001,6 +1339,7 @@ const MOUNT = {
   game: () => {
     const v = {
       profiles: h('nav', { class: 'profiles', 'aria-label': 'Players on this phone' }),
+      turn: h('section', { class: 'turn-wrap', 'aria-live': 'polite' }),
       stale: h('div', { class: 'stale-bar', role: 'status' }),
       card: h('section', { class: 'card-wrap', 'aria-live': 'polite' }),
       curses: h('section', { class: 'curses' }),
@@ -1015,7 +1354,7 @@ const MOUNT = {
       'main',
       { class: 'screen game' },
       h('header', { class: 'top' }, brand(), v.phase),
-      v.profiles, v.stale, v.card, v.curses, v.me, v.priv, v.players, v.ticker, v.foot,
+      v.turn, v.profiles, v.stale, v.card, v.curses, v.me, v.priv, v.players, v.ticker, v.foot,
     );
     return v;
   },
@@ -1124,8 +1463,9 @@ const UPDATE = {
     const room = S.room ? S.room : null;
     const me = activeSession();
     const pid = me?.playerId;
-    const covered = S.cover;
-    const priv = covered ? null : obj(S.priv[pid]);
+    // No whole-screen cover (11/19): public things show for whoever has the phone; each secret
+    // has its own tap (hidden sections, secret prompts).
+    const priv = obj(S.priv[pid]);
 
     // Amounts read like the Table's: "a full drink and 3 sips" once they're that big.
     const perDrink = num(room?.sipsPerDrink);
@@ -1144,14 +1484,20 @@ const UPDATE = {
       count != null && left == null && h('span', { class: 'chip dim', text: plural(count, 'card') }),
     ]);
 
-    // Profile switcher (only when this phone holds more than one player)
-    const counts = S.sessions.map((s) => openCount(s.playerId) + (S.unseenRecap.has(s.playerId) ? 1 : 0));
+    // Shared phone: whose turn it is, big ("Sam's vote"), then a small manual switcher whose
+    // badges count what's waiting for each player.
+    const needs = sharedPhone() ? phoneNeeds() : [];
+    region(V.turn, sharedPhone() && pid ? [turnTitle(pid), pid] : null, (d) => d && h('div', { class: 'turn', 'data-testid': 'turn' },
+      h('span', { class: 'turn-label', text: 'On this phone now' }),
+      h('b', { class: 'turn-name', 'data-testid': 'turn-name', style: { '--fit': String(longestWord(d[0])) }, text: d[0] })));
+    V.turn.hidden = !(sharedPhone() && pid);
+    const counts = S.sessions.map((s) => needs.filter((n) => n.pid === s.playerId).length + (S.unseenRecap.has(s.playerId) ? 1 : 0));
     region(V.profiles, [S.sessions.map((s) => [s.playerId, sessionName(s)]), pid, counts], ([list, active, cs]) =>
-      list.length < 2 ? [] : list.map(([id, name], i) =>
+      list.length < 2 ? [] : [h('span', { class: 'profiles-label', text: 'Switch:' }), ...list.map(([id, name], i) =>
         h('button', {
           class: `profile${id === active ? ' on' : ''}`, 'data-profile': id, 'aria-pressed': String(id === active),
           onclick: () => switchTo(id),
-        }, h('span', { text: i === 0 ? `Me · ${name}` : name }), cs[i] > 0 && id !== active && h('span', { class: 'badge', text: String(cs[i]) }))));
+        }, h('span', { text: i === 0 ? `Me · ${name}` : name }), cs[i] > 0 && id !== active && h('span', { class: 'badge', text: String(cs[i]) })))]);
 
     // The error bar: after 15 s without the Table, or straight away when this phone is offline.
     const showBar = (S.stale || isOffline()) && !!room;
@@ -1159,7 +1505,7 @@ const UPDATE = {
     region(V.stale, [showBar, mine], ([show, m]) => show && waitingBlock(false, m));
     V.stale.hidden = !showBar;
 
-    renderCard(room, pid, priv, covered);
+    renderCard(room, pid, priv);
 
     // Curses: sticker tags. A curse on you is purple; curses on others / everyone are white.
     const curses = arr(room?.curses).map(obj).filter((c) => str(c.text));
@@ -1180,7 +1526,7 @@ const UPDATE = {
     const owe = num(you.owe, num(pub.owe, 0));
     const bank = num(you.bank, num(pub.bank, 0));
     const oweText = drinkAmountShort(owe, perDrink, shots);
-    region(V.me, [sessionName(me), owe, oweText, bank, covered], ([name, o, ot, b, cov]) => cov ? [] : [
+    region(V.me, [sessionName(me), owe, oweText, bank], ([name, o, ot, b]) => [
       h('div', { class: 'me-name' }, h('span', { class: 'dim', text: 'You are' }), h('b', { text: name })),
       h('div', { class: 'me-stats' },
         h('div', { class: `stat owe${o > 0 ? ' hot' : ''}`, 'data-testid': 'owe' }, h('span', { class: 'stat-l', text: 'Owe' }),
@@ -1191,9 +1537,10 @@ const UPDATE = {
     // Private sections + actions
     const now = Date.now();
     let sections = arr(priv?.sections).map(obj).filter((s) => str(s.id) || str(s.title));
-    // Thumb Master power live: everyone gets the same covered box (only the holder's is real).
-    if (priv && thumbPowerLive(room) && !sections.some((s) => s.id === THUMB_SECTION && s.hidden === true)) {
-      sections = [DECOY_THUMB, ...sections];
+    // Thumb Master power live: everyone gets the same covered box (only the holder's is real),
+    // in the very spot the real one would be.
+    if (thumbPowerLive(room) && !sections.some((s) => s.id === THUMB_SECTION && s.hidden === true)) {
+      sections = withThumbDecoy(sections);
     }
     const peeked = sections.filter((s) => S.peek[`${pid}:${s.id}`] > now).map((s) => s.id);
     const allActions = arr(priv?.actions).map(obj).filter((a) => str(a.id) && str(a.label));
@@ -1204,7 +1551,7 @@ const UPDATE = {
     const actions = allActions.filter((a) => !homeOf(a));
     const pressed = allActions.filter((a) => S.pressed[`${pid}:${a.id}`] > now).map((a) => a.id);
     const locked = tapsLocked();
-    region(V.priv, [pid, covered, sections, peeked, allActions, pressed, locked], () => covered ? [] : [
+    region(V.priv, [pid, sections, peeked, allActions, pressed, locked], () => [
       sections.length > 0 && h('div', { class: 'sections' }, sections.map((s) =>
         renderSection(pid, s, peeked.includes(s.id), allActions.filter((a) => homeOf(a) === s.id), pressed, locked))),
       actions.length > 0 && h('div', { class: 'actions' }, actions.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false))),
@@ -1232,7 +1579,7 @@ const UPDATE = {
     ]);
     V.ticker.hidden = !ticker.length;
 
-    region(V.foot, [S.sessions.length, covered, S.chime], ([, cov, ch]) => cov ? [] : [
+    region(V.foot, [S.sessions.length, S.chime], ([, ch]) => [
       h('button', { class: 'btn ghost small', 'data-testid': 'add-player', onclick: () => { S.addingPlayer = true; S.joinMode = 'pick'; S.joining = null; render(); } }, icon('userPlus'), 'Someone sharing this phone'),
       chimeToggle(ch, true),
       h('button', { class: 'btn ghost small danger-text', 'data-testid': 'leave', onclick: confirmLeave }, icon('exit'), 'Leave game'),
@@ -1249,24 +1596,16 @@ const UPDATE = {
       S.sessions.length > 0 && h('button', {
         class: 'btn ghost big', 'data-testid': 'back-to-game',
         text: S.room && S.room.phase !== 'ended' ? 'The game is still on — back to the Table' : 'Back to the game',
-        onclick: () => { S.showWrappedLanding = false; S.cover = S.sessions.length > 1; render(); },
+        onclick: () => { S.showWrappedLanding = false; render(); },
       }),
     ]);
   },
 };
 
-function openCount(pid) {
-  const map = S.prompts[pid];
-  if (!map) return 0;
-  let n = 0;
-  for (const e of map.values()) if (e.answered === undefined && !isExpired(e.p)) n++;
-  return n;
-}
-
 // ---------- the big card ----------
 
 function currentSpotlight(room, pid, priv) {
-  if (!pid || S.cover) return null;
+  if (!pid) return null;
   const card = room && room.card ? obj(room.card) : null;
   const ps = priv && priv.spotlight ? obj(priv.spotlight) : null;
   const targeted = !!card && arr(card.targets).includes(pid);
@@ -1277,7 +1616,7 @@ function currentSpotlight(room, pid, priv) {
   };
 }
 
-function renderCard(room, pid, priv, covered) {
+function renderCard(room, pid, priv) {
   const card = room && room.card ? obj(room.card) : null;
   const spot = currentSpotlight(room, pid, priv);
 
@@ -1297,7 +1636,7 @@ function renderCard(room, pid, priv, covered) {
       tax: num(card.chickenTax), endsAt: num(obj(card.timer).endsAt),
       taxText: num(card.chickenTax) != null ? drinkAmount(num(card.chickenTax), num(room?.sipsPerDrink), room?.hardLiquor === true) : null,
     },
-    spot: spot && spot.text, name: spot ? sessionName(activeSession()) : '', covered,
+    spot: spot && spot.text, name: spot ? sessionName(activeSession()) : '',
   };
   region(V.card, data, (d) => {
     if (!d.has) return waitingBlock(true, false);
@@ -1371,7 +1710,7 @@ function actionButton(pid, a, sent, locked, inPeek) {
       if (inPeek) e.stopPropagation();
       pressAction(pid, a);
     },
-  }, sent ? [icon('check', 22), 'Sent'] : a.label);
+  }, sent ? [icon('check', 22), 'Sent'] : a.photo === true ? [icon('camera', 22), a.label] : a.label);
 }
 
 /**
@@ -1429,7 +1768,7 @@ function renderBanner(view) {
     }
   }
   // Quick Draw: nothing may cover the TAP button mid-race, so the banner folds into the strip.
-  if (b && !S.bannerMin && hasOpenTap(S.activeId)) S.bannerMin = true;
+  if (b && !S.bannerMin && hasOpenTap()) S.bannerMin = true;
   // A running card clock also shows on the takeover: nobody pays for a timer they couldn't see.
   const card = S.room?.card;
   const ends = b && cardTimerRunning(card) ? cardTimerEnds(card) : null;
@@ -1454,11 +1793,11 @@ function renderBanner(view) {
   });
 }
 
-/** This player has a Quick Draw (tap) prompt still running. */
-function hasOpenTap(pid) {
-  const map = pid && S.prompts[pid];
-  if (!map) return false;
-  for (const e of map.values()) if (str(e.p.kind) === 'tap' && e.answered === undefined && !isExpired(e.p)) return true;
+/** Someone on this phone has a Quick Draw (tap) prompt still running. */
+function hasOpenTap() {
+  for (const map of Object.values(S.prompts)) {
+    for (const e of map.values()) if (str(e.p.kind) === 'tap' && e.answered === undefined && !isExpired(e.p)) return true;
+  }
   return false;
 }
 
@@ -1468,8 +1807,21 @@ const promptEls = new Map(); // `${pid}:${id}` -> element (kept so typing surviv
 
 function renderSheet(view) {
   const pid = S.activeId;
-  const show = view === 'game' && !S.cover && pid;
-  const entries = show ? [...(S.prompts[pid]?.values() || [])].sort((a, b) => b.receivedAt - a.receivedAt) : [];
+  const show = view === 'game' && !!pid;
+  // The player on screen: all their prompts. Anyone else on this phone: only a running Quick
+  // Draw TAP (a race can't wait for the phone to come round), labelled with their name.
+  const items = [];
+  if (show) {
+    for (const e of S.prompts[pid]?.values() || []) items.push({ owner: pid, e });
+    for (const s of S.sessions) {
+      if (s.playerId === pid) continue;
+      for (const e of S.prompts[s.playerId]?.values() || []) {
+        if (str(e.p.kind) === 'tap' && e.answered === undefined && !isExpired(e.p)) items.push({ owner: s.playerId, e });
+      }
+    }
+    items.sort((a, b) => b.e.receivedAt - a.e.receivedAt);
+  }
+  const entries = items.filter((x) => x.owner === pid).map((x) => x.e);
   const results = show ? S.results.filter((r) => r.pid === pid) : [];
 
   let sheet = layers.sheet.firstElementChild;
@@ -1481,14 +1833,19 @@ function renderSheet(view) {
     layers.sheet.append(sheet);
   }
   const [head, resultsEl, list] = sheet.children;
-  sheet.hidden = !entries.length && !results.length;
-  sheet.classList.toggle('min', S.sheetMin && entries.length > 0);
+  sheet.hidden = !items.length && !results.length;
+  sheet.classList.toggle('min', S.sheetMin && items.length > 0);
 
   const open = entries.filter((e) => e.answered === undefined && !isExpired(e.p)).length;
   const sent = entries.some((e) => e.answered !== undefined);
-  region(head, [entries.length, open, sent, S.sheetMin], ([n, o, any, min]) => n === 0 ? [] : [
+  // On a shared phone the sheet says whose it is, big: "Sam's vote".
+  const whose = sharedPhone() && open > 0 ? turnTitle(pid) : null;
+  region(head, [items.length, open, sent, S.sheetMin, whose], ([n, o, any, min, w]) => n === 0 ? [] : [
     // "Sent" only if something was really answered; a prompt that just ran out says so.
-    h('span', { class: 'sheet-title', text: o > 0 ? `Your move${o > 1 ? ` · ${o}` : ''}` : any ? 'Sent' : "Time's up" }),
+    h('span', {
+      class: `sheet-title${w ? ' whose' : ''}`, 'data-testid': 'sheet-title',
+      text: w || (o > 0 ? `Your move${o > 1 ? ` · ${o}` : ''}` : any ? 'Sent' : n > entries.length ? 'Quick Draw' : "Time's up"),
+    }),
     h('button', { class: 'btn ghost small', text: min ? 'Show' : 'Hide', onclick: () => { S.sheetMin = !S.sheetMin; render(); } }),
   ]);
   region(resultsEl, results.map((r) => [r.title, r.text]), (rs) =>
@@ -1497,13 +1854,15 @@ function renderSheet(view) {
 
   // Keyed reconciliation: reuse existing elements; never detach the one being typed in.
   const wanted = new Set();
-  entries.forEach((e, i) => {
-    const key = `${pid}:${e.p.id}`;
+  items.forEach(({ owner, e }, i) => {
+    const key = `${owner}:${e.p.id}`;
     wanted.add(key);
-    const sig = JSON.stringify([e.p, e.answered, e.label]);
+    const covered = secretCovered(owner, e);
+    const named = sharedPhone() && str(e.p.kind) === 'tap';
+    const sig = JSON.stringify([e.p, e.answered, e.label, covered, named, sharedPhone()]);
     let el = promptEls.get(key);
     if (!el || el._sig !== sig) {
-      const fresh = buildPrompt(pid, e);
+      const fresh = buildPrompt(owner, e, { covered, named });
       fresh._sig = sig;
       // The same prompt came again with something new (e.g. its ideas arrived): keep what
       // was typed, and the cursor, so nobody loses a half-written mission.
@@ -1526,9 +1885,11 @@ function renderSheet(view) {
 function keepTyping(oldEl, freshEl) {
   const before = oldEl.querySelector('textarea');
   const after = freshEl.querySelector('textarea');
-  if (!before || !after || after.value || !before.value) return;
-  after.value = before.value;
-  after.dispatchEvent(new Event('input'));
+  if (!before || !after) return;
+  if (!after.value && before.value) {
+    after.value = before.value;
+    after.dispatchEvent(new Event('input'));
+  }
   if (document.activeElement === before) {
     const [a, b] = [before.selectionStart, before.selectionEnd];
     queueMicrotask(() => {
@@ -1538,19 +1899,52 @@ function keepTyping(oldEl, freshEl) {
   }
 }
 
-function buildPrompt(pid, entry) {
+function buildPrompt(pid, entry, opts = {}) {
   const p = entry.p;
   const kind = str(p.kind);
   const answered = entry.answered !== undefined;
+  const key = `${pid}:${p.id}`;
+  const who = sessionName(S.sessions.find((s) => s.playerId === pid));
+  const timer = num(p.endsAt) != null && h('span', { class: 'p-timer', 'data-ends-at': String(p.endsAt) });
+  // A secret prompt (a mission being written, a sealed bid, a Showdown stake…) on a shared
+  // phone: nothing about it shows until its player taps it open. Its clock still runs.
+  if (opts.covered) {
+    const covered = h('section', { class: 'prompt secret-covered', 'data-prompt': p.id, 'data-pid': pid, 'data-secret': 'covered' },
+      h('button', {
+        class: 'secret-open', type: 'button', 'data-testid': 'secret-open',
+        onclick: () => { S.secretOpen[key] = true; render(); },
+      }, icon('eye', 30),
+      h('span', { class: 'peek-text', text: `${who}: something private for you` }),
+      h('span', { class: 'peek-sub', text: 'Tap to open' })),
+      timer);
+    if (num(p.endsAt) != null) covered.dataset.expires = String(p.endsAt);
+    return covered;
+  }
+  const secret = p.secret === true;
+  // Answered and secret: just "Sent" (what was typed or bid never sits on screen).
+  if (secret && answered) {
+    return h('section', { class: 'prompt answered secret-sent', 'data-prompt': p.id, 'data-pid': pid, 'data-kind': kind },
+      h('div', { class: 'p-head' }, h('h3', { class: 'p-title', text: str(p.title) || 'Quick question' })),
+      h('div', { class: 'p-state', 'data-testid': 'secret-sent' }, 'Sent', icon('check', 16)));
+  }
   // Anonymous vote: never echo the name back ("Sent: Alex" sat on screen for 20 s).
   const anon = p.anonymous === true;
   const fs = h('fieldset', { disabled: answered || (isLockable(p) && tapsLocked()) });
+  const opened = secret && sharedPhone();
+  const title = opts.named ? `${who}: ${str(p.title) || 'Quick Draw'}` : str(p.title) || 'Quick question';
   const el = h('section', {
-    class: `prompt k-${kind || 'unknown'}${answered ? ' answered' : ''}`, 'data-prompt': p.id, 'data-kind': kind,
+    class: `prompt k-${kind || 'unknown'}${answered ? ' answered' : ''}${opened ? ' secret-open' : ''}`,
+    'data-prompt': p.id, 'data-kind': kind, 'data-pid': pid,
   },
   h('div', { class: 'p-head' },
-    h('h3', { class: 'p-title', text: str(p.title) || 'Quick question' }),
-    num(p.endsAt) != null && h('span', { class: 'p-timer', 'data-ends-at': String(p.endsAt) })),
+    h('h3', { class: 'p-title', text: title }),
+    timer,
+    // Opened on a shared phone: "Hide" covers it again (so does the phone switching player).
+    opened && h('button', {
+      class: 'btn hide-secret', type: 'button', 'data-testid': 'secret-hide', text: 'Hide',
+      onclick: () => { delete S.secretOpen[key]; render(); },
+    })),
+  opened && h('div', { class: 'priv-note' }, icon('eyeOff', 18), `Only ${who} should see this`),
   str(p.text) && h('p', { class: 'p-text', text: p.text }),
   anon && h('div', { class: 'pill anon', text: 'Anonymous' }),
   fs,
@@ -1559,6 +1953,7 @@ function buildPrompt(pid, entry) {
     : h('div', { class: 'p-state', text: answered ? `Sent: ${entry.label}` : '' }));
   if (num(p.endsAt) != null) el.dataset.expires = String(p.endsAt);
   if (isLockable(p)) el.dataset.lockable = '1';
+  if (opts.named) el.dataset.tapLabel = `${who}: TAP!`;
 
   const send = (value, label) => answer(pid, p.id, value, label);
 
@@ -1598,8 +1993,18 @@ function buildPrompt(pid, entry) {
     };
     const minus = h('button', { class: 'btn step', 'aria-label': 'less', text: '−', onclick: () => set(value - step) });
     const plus = h('button', { class: 'btn step', 'aria-label': 'more', text: '+', onclick: () => set(value + step) });
+    // A number prompt with `options` (Phase 2b: a bet's picks, a loan's lenders, a deal's
+    // buyers, "Bid") has one send button per option; the one tapped goes along as `option`.
+    // Otherwise a single Send.
+    const sendOpts = arr(p.options).map(obj).filter((o) => str(o.id));
     fs.append(h('div', { class: 'stepper' }, minus, out, plus),
-      h('button', { class: 'btn primary big', 'data-testid': 'send-number', text: 'Send', onclick: () => send(value, String(value)) }));
+      sendOpts.length
+        ? h('div', { class: `options num-sends${sendOpts.length > 4 ? ' many' : ''}` }, sendOpts.map((o, i) =>
+          h('button', {
+            class: `btn ${i === 0 ? 'primary' : 'opt'} send-opt`, 'data-send-option': o.id, text: str(o.label) || o.id,
+            onclick: () => answer(pid, p.id, value, `${value} · ${str(o.label) || o.id}`, o.id),
+          })))
+        : h('button', { class: 'btn primary big', 'data-testid': 'send-number', text: 'Send', onclick: () => send(value, String(value)) }));
     set(value);
     if (answered) minus.disabled = plus.disabled = true;
   } else if (kind === 'text') {
@@ -1609,6 +2014,7 @@ function buildPrompt(pid, entry) {
       autocomplete: 'off', 'aria-label': str(p.title) || 'Your answer',
     });
     if (answered) ta.value = String(entry.answered);
+    else if (S.drafts[key]) ta.value = S.drafts[key]; // typed before it was covered
     const count = h('span', { class: 'count', text: `${ta.value.length}/${maxLength}` });
     // A text prompt with `options` has one send button per option ("Save it" / "Save: needs a
     // photo"); the one tapped goes along as `option`. Otherwise a single Send.
@@ -1635,6 +2041,7 @@ function buildPrompt(pid, entry) {
       if (/^insertFrom(Paste|Drop|PasteAsQuotation|Yank)/.test(e.inputType || '')) block(e);
     });
     ta.addEventListener('input', refresh);
+    ta.addEventListener('input', () => { S.drafts[key] = ta.value; });
     sends.forEach((b, i) => b.addEventListener('click', () => {
       const v = ta.value.trim();
       if (v) answer(pid, p.id, v, v, sendOpts[i] ? sendOpts[i].id : undefined);
@@ -1671,10 +2078,11 @@ function armTap(el) {
   el.classList.add('armed');
   const zone = el.querySelector('.tap-zone');
   if (!zone) return;
-  const pid = S.activeId;
+  // Whose TAP it is (several players on one phone each get their own button).
+  const pid = el.dataset.pid || S.activeId;
   const id = el.dataset.prompt;
   zone.replaceChildren(h('button', {
-    class: 'btn tap', 'data-testid': 'tap', text: 'TAP!',
+    class: `btn tap${el.dataset.tapLabel ? ' named' : ''}`, 'data-testid': 'tap', text: el.dataset.tapLabel || 'TAP!',
     onpointerdown: (e) => { e.preventDefault(); answer(pid, id, 'tap', 'TAP'); },
     onclick: () => answer(pid, id, 'tap', 'TAP'),
   }));
@@ -1701,22 +2109,69 @@ function wrappedCard(rec, mode, showName) {
 const sameDay = (ms) => new Date(ms).toDateString() === new Date().toDateString();
 
 function renderRecap(view) {
-  const rec = view === 'game' && !S.cover && S.recap && S.wrapped[S.recap];
+  const rec = view === 'game' && S.recap && S.wrapped[S.recap];
   region(layers.recap, rec ? [S.recap, rec.receivedAt] : null, () => rec && h('div', { class: 'overlay recap' },
     wrappedCard(rec, 'tonight', false),
     h('button', { class: 'btn primary big', text: 'Close', onclick: () => { S.recap = null; render(); } })));
 }
 
-// ---------- pass-the-phone cover ----------
+// ---------- Photo Proof sheet ----------
 
-function renderCover(view) {
-  const s = view === 'game' && S.cover ? activeSession() : null;
-  const name = s ? sessionName(s) : '';
-  region(layers.cover, s ? [s.playerId, name] : null, () => s && h('div', { class: 'cover', 'data-testid': 'pass-cover' },
-    brand(),
-    h('div', { class: 'cover-title' }, h('span', { text: 'Pass to' }), h('b', { style: { '--fit': String(longestWord(name)) }, text: name })),
-    h('p', { class: 'cover-sub' }, icon('eyeOff', 22), 'Everyone else look away.'),
-    h('button', { class: 'btn primary big', 'data-testid': 'reveal', text: `I'm ${name} — show me`, onclick: uncover })));
+/** The photo sheet: take it, check it, send it (with progress), or say why it didn't go. */
+function renderPhoto(view) {
+  const ph = view === 'game' ? S.photo : null;
+  const data = ph && [ph.pid, ph.status, ph.sent, ph.count, ph.checking === true, ph.error, ph.attempt, ph.label, ph.text];
+  region(photoBox, data, () => {
+    if (!ph) return [];
+    const who = sharedPhone() ? sessionName(S.sessions.find((s) => s.playerId === ph.pid)) : '';
+    const preview = ph.prepared && h('img', { class: 'photo-preview', 'data-testid': 'photo-preview', src: ph.prepared.dataUrl, alt: 'Your photo' });
+    const cancel = h('button', { class: 'btn ghost', type: 'button', 'data-testid': 'photo-cancel', text: 'Cancel', onclick: closePhoto });
+    const skip = h('button', { class: 'btn ghost', type: 'button', 'data-testid': 'photo-skip', text: 'Send without a photo', onclick: sendWithoutPhoto });
+    let body;
+    if (ph.status === 'pick') {
+      body = [
+        h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'photo-take', onclick: takePhoto }, icon('camera', 26), 'Take the photo'),
+        skip, cancel,
+      ];
+    } else if (ph.status === 'preparing') {
+      body = [h('div', { class: 'waiting' }, h('div', { class: 'spinner', 'aria-hidden': 'true' }), h('div', { class: 'waiting-title', text: 'Getting it ready…' })), cancel];
+    } else if (ph.status === 'preview') {
+      body = [
+        preview,
+        h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'photo-send', text: 'Send it', onclick: sendPhoto }),
+        h('button', { class: 'btn normal', type: 'button', 'data-testid': 'photo-retake', text: 'Take it again', onclick: takePhoto }),
+        cancel,
+      ];
+    } else if (ph.status === 'sending') {
+      const pct = ph.count ? Math.round((ph.sent / ph.count) * 100) : 0;
+      body = [
+        preview,
+        h('div', { class: 'photo-progress', 'data-testid': 'photo-progress', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(pct) },
+          h('div', { class: 'photo-bar' }, h('i', { style: { width: `${pct}%` } })),
+          h('span', { text: ph.checking ? 'Checking with the Table…' : `Sending… ${ph.sent} of ${ph.count}` })),
+        cancel,
+      ];
+    } else if (ph.status === 'sent') {
+      body = [preview, h('div', { class: 'p-state photo-done', 'data-testid': 'photo-sent' }, icon('check', 18), 'Sent to the Table')];
+    } else {
+      body = [
+        preview,
+        h('div', { class: 'notice bad', 'data-testid': 'photo-error', text: ph.error || "It didn't send." }),
+        ph.prepared
+          ? h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'photo-retry', text: 'Try again', onclick: sendPhoto })
+          : h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'photo-take', onclick: takePhoto }, icon('camera', 26), 'Take it again'),
+        ph.prepared && h('button', { class: 'btn normal', type: 'button', 'data-testid': 'photo-retake', text: 'Take a new one', onclick: takePhoto }),
+        skip, cancel,
+      ];
+    }
+    return h('div', { class: 'overlay photo-sheet', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Photo proof', 'data-testid': 'photo-sheet', 'data-status': ph.status },
+      h('div', { class: 'photo-card' },
+        h('div', { class: 'photo-kicker' }, icon('camera', 18), who ? `Photo proof · ${who}` : 'Photo proof'),
+        h('h2', { class: 'photo-title', text: ph.label }),
+        ph.text && h('p', { class: 'photo-text', text: ph.text }),
+        body,
+        h('p', { class: 'photo-note', text: 'It goes only to the Table\'s phone. Nothing is posted or saved here.' })));
+  });
 }
 
 // ---------- modal ----------
