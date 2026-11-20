@@ -102,6 +102,9 @@ const ICONS = {
   camera: ['M3.5 8h3.5l2-3h6l2 3h3.5v11h-17z', 'M12 10a3.5 3.5 0 1 0 0 7 3.5 3.5 0 1 0 0-7z'],
   bell: ['M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z', 'M10 20.5a2.2 2.2 0 0 0 4 0'],
   clock: ['M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 1 0 0-17z', 'M12 7.5V12l3 2'],
+  // 11/20 build: How to play, the Table's low battery.
+  book: ['M3.5 5.5h6a2.5 2.5 0 0 1 2.5 2.5v11a2 2 0 0 0-2-2H3.5z', 'M20.5 5.5h-6A2.5 2.5 0 0 0 12 8v11a2 2 0 0 1 2-2h6.5z'],
+  battery: ['M3 8h15v8H3z', 'M21 10.5v3', 'M6 11v2'],
 };
 
 /** icon('eye', 20) -> a decorative <svg> (aria-hidden; the button's text is its label). */

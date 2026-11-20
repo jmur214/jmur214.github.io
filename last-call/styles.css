@@ -2,7 +2,7 @@
    (never blurred), no gradients, labels that tilt like stickers, one chunky typeface for everything.
    Mobile-first, one-handed. Text on any colored fill is ink (#111): white text fails on the dare red.
    Tilts use the `rotate` property (not `transform`) so press/pop animations compose with them.
-   Layers (z-index): view < sheet < handover < banner < recap < photo < modal < toast < flash.
+   Layers (z-index): view < sheet < handover < how to play < banner < story (Wrapped) < photo < modal < toast < flash.
    (The banner sits above the prompt sheet so its "Got it" is never covered.) */
 
 /* Bricolage Grotesque, bundled (SIL OFL, fonts/OFL.txt). Variable: weight 400–800, optical size 12–96. */
@@ -700,37 +700,122 @@ section.me:empty { display: none; }
 /* ---------- overlays: recap, cover, modal, toast, flash ---------- */
 
 .overlay { position: fixed; inset: 0; overflow-y: auto; }
+/* ---------- Wrapped: the story (11/20 build) ----------
+   One big moment per screen on a yellow-theme color block (or its pink / green / sky / orange swap),
+   tapped (right = next, the left third = back) or swiped through, a progress bar across the top.
+   --story-bg / --story-accent / --story-accent-text come from the slide. */
 .layer-recap { position: relative; z-index: 40; }
-.recap {
-  background: var(--bg); display: flex; flex-direction: column; gap: 18px;
-  padding: calc(var(--safe-t) + 20px) calc(var(--safe-r) + var(--gutter)) calc(var(--safe-b) + 20px) calc(var(--safe-l) + var(--gutter));
+.story {
+  background: var(--story-bg, var(--bg)); display: flex; flex-direction: column; gap: 14px; overflow-wrap: break-word;
+  padding: calc(var(--safe-t) + 10px) calc(var(--safe-r) + var(--gutter)) calc(var(--safe-b) + 16px) calc(var(--safe-l) + var(--gutter));
+  -webkit-user-select: none; user-select: none;
 }
-.recap > * { width: 100%; max-width: 560px; margin-left: auto; margin-right: auto; flex: none; }
+.story > * { width: 100%; max-width: 560px; margin-left: auto; margin-right: auto; flex: none; }
+.story-progress { display: flex; gap: 4px; }
+.story-progress i { flex: 1; height: 6px; border-radius: 999px; background: rgba(17, 17, 17, .18); }
+.story-progress i.on { background: var(--ink); }
+.story-top { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.story-brand { font-size: 12px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.story-count { margin-left: auto; font-size: 13px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.story-top .btn, .story-foot .btn.small { background: var(--surface); }
+.story-who { font-size: 15px; font-weight: 800; }
+.story-body { flex: 1 0 auto; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 16px; animation: rise .2s ease-out; }
+.story-kicker {
+  padding: 6px 12px; border-radius: 10px; background: var(--ink); color: var(--surface);
+  font-size: 13px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase;
+}
+.story-sticker {
+  max-width: 100%; padding: 8px 14px; border-radius: 14px; background: var(--story-accent, var(--ink)); color: var(--story-accent-text, var(--surface));
+  border: 3px solid var(--ink); box-shadow: var(--shadow-panel); rotate: -3deg; margin-left: 4px;
+  font-size: 20px; line-height: 1.1; font-weight: 800; text-transform: uppercase;
+}
+.story-big {
+  align-self: stretch; margin: 4px 8px 8px 0; padding: 14px 20px; border-radius: 26px; background: var(--surface);
+  border: 4px solid var(--ink); box-shadow: 10px 10px 0 var(--ink); rotate: -2deg; animation: pop .2s ease-out;
+  font-size: clamp(34px, calc((min(100vw, 560px) - 100px) / (var(--fit, 8) * .6)), 64px); line-height: .98;
+  font-weight: 800; letter-spacing: -.01em; overflow-wrap: anywhere;
+}
+.story-big.huge { font-size: clamp(76px, 30vw, 150px); line-height: .9; text-align: center; font-variant-numeric: tabular-nums; }
+.story-title { font-size: 24px; line-height: 1.2; font-weight: 800; }
+.story-quote {
+  margin: 4px 0; align-self: stretch; overflow: hidden; border-radius: var(--radius-card); background: var(--surface);
+  border: var(--border); box-shadow: var(--shadow-card); rotate: 1deg;
+}
+.story-quote-band { display: block; height: 22px; background: var(--story-accent, var(--dare)); border-bottom: 3px solid var(--ink); }
+.story-quote p { padding: 16px 18px 18px; font-size: 23px; line-height: 1.22; font-weight: 800; }
+.story-lines {
+  align-self: stretch; display: flex; flex-direction: column; gap: 8px; padding: 14px 16px;
+  border-radius: var(--radius-panel); background: var(--surface); border: var(--border); box-shadow: var(--shadow-panel);
+}
+.story-lines p { font-size: 19px; line-height: 1.25; font-weight: 800; }
+.story-rows { align-self: stretch; display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.story-row {
+  display: flex; flex-direction: column; gap: 2px; padding: 10px 14px; border-radius: 14px; background: var(--surface);
+  border: 2px solid var(--ink); box-shadow: var(--shadow-small); rotate: -1deg;
+}
+.story-row:nth-child(even) { rotate: 1.2deg; }
+.story-row:first-child { box-shadow: var(--shadow-panel); }
+.story-row b { font-size: 17px; line-height: 1.15; font-weight: 800; letter-spacing: .02em; text-transform: uppercase; }
+.story-row span { font-size: 16px; font-weight: 700; }
+.story-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.story-foot .btn.big { flex: 1 1 100%; }
+.story-foot .btn.small.story-next { background: var(--ink); color: var(--bg); box-shadow: 3px 3px 0 var(--surface); }
+.story-hint { flex: 1; text-align: center; font-size: 14px; font-weight: 700; color: var(--soft); }
+.wrapped-landing .hero { margin-top: 8px; }
 
-.wrapped {
-  display: flex; flex-direction: column; gap: 14px; padding: 20px 18px 22px; border-radius: var(--radius-card);
-  background: var(--surface); border: var(--border); box-shadow: var(--shadow-card); overflow-wrap: break-word;
+/* ---------- How to play (11/20 build): a few short pages, tonight's parts only ---------- */
+.layer-howto { position: relative; z-index: 34; }
+.howto {
+  background: var(--howto-bg, var(--bg)); display: flex; flex-direction: column; gap: 16px;
+  padding: calc(var(--safe-t) + 12px) calc(var(--safe-r) + var(--gutter)) calc(var(--safe-b) + 16px) calc(var(--safe-l) + var(--gutter));
 }
-.wrapped.morning { background: var(--mission); }
-.wr-kicker {
-  align-self: flex-start; padding: 6px 12px; border-radius: 10px; background: var(--ink); color: var(--surface); rotate: -2deg;
-  font-size: 14px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase;
+.howto > * { width: 100%; max-width: 560px; margin-left: auto; margin-right: auto; flex: none; }
+.howto-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; min-height: 44px; }
+.howto-count { font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.howto-top .btn, .howto-foot .btn.small { background: var(--surface); }
+.howto-body { flex: 1 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.howto-title {
+  align-self: center; max-width: 100%; margin: 8px 6px 10px 0; padding: 14px 22px; border-radius: 26px; background: var(--surface);
+  border: 4px solid var(--ink); box-shadow: 10px 10px 0 var(--ink); rotate: -3deg; text-align: center; animation: pop .18s ease-out;
+  font-size: clamp(30px, calc((min(100vw, 560px) - 110px) / (var(--fit, 8) * .62)), 58px); line-height: .95; font-weight: 800; overflow-wrap: anywhere;
 }
-.wr-title { font-size: 40px; line-height: 1; font-weight: 800; letter-spacing: -.01em; }
-.wr-name { font-weight: 800; color: var(--soft); }
-.wr-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.wr-stat {
-  display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border-radius: var(--radius-panel);
-  background: var(--bg); border: var(--border); box-shadow: var(--shadow-panel); min-width: 0;
+.howto-lines { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.howto-lines li {
+  display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border-radius: var(--radius-panel); background: var(--surface);
+  border: var(--border); box-shadow: var(--shadow-panel); rotate: -.5deg;
+  font-size: 20px; line-height: 1.25; font-weight: 800; overflow-wrap: break-word;
 }
-.wr-stat:nth-child(4n+2) { background: var(--sky); }
-.wr-stat:nth-child(4n+3) { background: var(--green); }
-.wr-stat:nth-child(4n+4) { background: var(--dare); }
-.wr-stat span { font-size: 14px; font-weight: 700; line-height: 1.2; }
-.wr-stat b { font-size: 40px; line-height: 1.05; font-weight: 800; font-variant-numeric: tabular-nums; }
-.wr-line { font-size: 19px; font-weight: 700; }
-.wr-note { font-size: 15px; font-weight: 600; color: var(--soft); }
-.wrapped-landing .wrapped { margin-top: 4px; }
+.howto-lines li:nth-child(even) { rotate: .6deg; }
+.howto-lines li span { min-width: 0; }
+.howto-n {
+  flex: none; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%;
+  background: var(--ink); color: var(--surface); font-size: 16px; line-height: 1;
+}
+.howto-dots { display: flex; justify-content: center; gap: 6px; }
+.howto-dots i { width: 8px; height: 8px; border-radius: 999px; background: rgba(17, 17, 17, .22); }
+.howto-dots i.on { width: 22px; background: var(--ink); }
+.howto-foot { display: flex; gap: 10px; align-items: stretch; }
+.howto-foot .btn.big { flex: 1; }
+.howto-foot .btn.small { min-height: 72px; }
+.howto-note { text-align: center; font-size: 14px; font-weight: 700; color: var(--soft); }
+
+/* ---------- The Table's low battery, a late joiner's quick rules (11/20 build) ---------- */
+.battery-wrap:empty, .battery-wrap[hidden], .rules-wrap:empty, .rules-wrap[hidden] { display: none; }
+.battery-note {
+  display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 14px; background: var(--dare);
+  border: var(--border); box-shadow: var(--shadow-panel); font-size: 16px; line-height: 1.25; font-weight: 800;
+}
+.quick-rules {
+  display: flex; flex-direction: column; gap: 8px; padding: 14px 16px; border-radius: var(--radius-panel);
+  background: var(--sky); border: var(--border); box-shadow: var(--shadow-panel); rotate: -.6deg;
+}
+.quick-rules-title {
+  align-self: flex-start; padding: 4px 10px; border-radius: 8px; background: var(--ink); color: var(--surface);
+  font-size: 12px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase;
+}
+.quick-rules-list { display: flex; flex-direction: column; gap: 4px; }
+.quick-rules-list li { font-size: 18px; line-height: 1.25; font-weight: 800; }
+.quick-rules .btn { align-self: flex-start; background: var(--surface); }
 
 /* A secret prompt's result on a shared phone (11/20): covered until its player taps it. */
 .result.secret-result { background: var(--private-bg); color: var(--surface); box-shadow: 6px 6px 0 var(--bg); }

@@ -2,10 +2,15 @@
 // try/catch: private mode, blocked storage or a full quota must never break the game
 // (the page just forgets on reload).
 //
-//   lc.session.<roomId>   [{ roomId, secret, playerId, name?, savedAt }]   (protocol: "stores an array")
+//   lc.session.<roomId>   [{ roomId, secret, playerId, name?, savedAt, lateUntil?, lateCheck? }]
+//                         (protocol: "stores an array"). lateUntil (11/20 build): joined once the
+//                         cards had started, so the quick rules show until room.cardCount reaches it;
+//                         lateCheck: joined before any room came (decided at the first one).
 //   lc.active.<roomId>    playerId of the profile last shown
 //   lc.lastRoom           roomId of the most recent game (for visits without a #fragment)
-//   lc.wrapped.<roomId>   { <playerId>: { wrapped, name, localShowAt, receivedAt } }
+//   lc.wrapped.<roomId>   { <playerId>: { wrapped, name, receivedAt } } (a record an older page saved
+//                         may still carry localShowAt: the retired noon comeback; ignored)
+//   lc.howto.<roomId>     { at }: "How to play" already opened by itself here (11/20 build)
 //   lc.chime              true / false: "Chime when it's my turn" (every game; on unless turned off)
 //   lc.rest.<roomId>      { text, at }: the last `room.rest` line (Bar Crawl: walking between bars),
 //                         so a page opened mid-walk reads as resting before any room arrives. 2 h.
@@ -72,9 +77,17 @@ export function saveSessions(roomId, sessions) {
       playerId: s.playerId,
       name: s.name || undefined,
       savedAt: s.savedAt || Date.now(),
+      lateUntil: Number.isFinite(s.lateUntil) ? s.lateUntil : undefined,
+      lateCheck: s.lateCheck === true ? true : undefined,
     })),
   );
 }
+
+// ---------- How to play (11/20 build) ----------
+
+/** Has "How to play" already opened by itself for this room (so a reload doesn't open it again)? */
+export const getHowToSeen = (roomId) => !!read(`lc.howto.${roomId}`, null);
+export const setHowToSeen = (roomId) => roomId && write(`lc.howto.${roomId}`, { at: Date.now() });
 
 export const getActive = (roomId) => read(`lc.active.${roomId}`, null);
 export const setActive = (roomId, playerId) => write(`lc.active.${roomId}`, playerId);
@@ -161,6 +174,9 @@ export function prune(now = Date.now()) {
         remove(k);
         remove(k.replace('lc.session.', 'lc.active.'));
       } else if (fresh.length !== list.length) write(k, fresh);
+    } else if (k.startsWith('lc.howto.')) {
+      const r = read(k, null);
+      if (!r || typeof r.at !== 'number' || now - r.at >= KEEP_MS) remove(k);
     } else if (k.startsWith('lc.wrapped.')) {
       const all = read(k, {});
       const recs = all && typeof all === 'object' ? Object.values(all) : [];

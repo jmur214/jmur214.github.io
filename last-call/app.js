@@ -17,7 +17,7 @@ import {
 } from './protocol.js';
 import * as store from './storage.js';
 import {
-  h, region, obj, arr, str, num, safeColor, titleCase, fmtCountdown, fmtClockTime, buzz, reducedMotion, icon, longestWord, plural,
+  h, region, obj, arr, str, num, safeColor, titleCase, fmtCountdown, buzz, reducedMotion, icon, longestWord, plural,
   drinkAmount, drinkAmountShort,
 } from './ui.js';
 import { chime, unlockAudio, setChimeEnabled, holdScreenAwake, audioNeedsTap, onAudioState } from './attention.js';
@@ -137,10 +137,14 @@ const S = {
   peek: {}, // `${pid}:${sectionId}` -> until
   modal: null, // { id, title, text, buttons: [{ label, style, run }] }
   toast: null, // { text, until }
-  recap: null, // playerId whose "Tonight's recap" overlay is open
+  recap: null, // playerId whose Wrapped story is open (11/20: a story you tap through)
+  storyIndex: 0, // which screen of it
   unseenRecap: new Set(),
   wrapped: {}, // playerId -> stored wrapped record (mirror of localStorage)
   showWrappedLanding: false,
+  // "How to play" (11/20 build, room.howTo): { index, auto } while it's open. `auto` = it opened by
+  // itself in the lobby (once per room); it closes when the night moves on (Start, the first card).
+  howTo: null,
   bannerKey: null,
   bannerMin: false,
   bannerFresh: false, // a new banner arrived: buzz/flash it once
@@ -209,8 +213,14 @@ function boot() {
     S.activeId = (S.sessions.find((s) => s.playerId === saved) || S.sessions[0] || {}).playerId || null;
     // (A shared phone opens on whoever needs it: evaluateTurn. Secrets stay behind their own taps.)
 
-    // A stored recap and no fresh per-player link -> the game is (probably) over: open on it.
+    // A stored recap and no fresh per-player link -> the game is (probably) over: open on it, with
+    // the story playing (11/20: Wrapped is at the end of the game, and stays on this page to reopen;
+    // there's no noon "Morning-After" version any more).
     S.showWrappedLanding = Object.keys(S.wrapped).length > 0 && !frag.s;
+    if (S.showWrappedLanding) {
+      const ids = Object.keys(S.wrapped).filter((id) => S.wrapped[id] && S.wrapped[id].wrapped);
+      openStory(ids.includes(S.activeId) ? S.activeId : ids[0] || null);
+    }
 
     if (transport && !S.fatal && (frag.r || S.sessions.length)) enterRoom();
   }
@@ -229,6 +239,18 @@ function boot() {
     }
   });
   window.addEventListener('pageshow', (e) => e.persisted && resync());
+  // The Wrapped story and How to play (11/20 build) by keyboard too: arrows, Escape.
+  document.addEventListener('keydown', (e) => {
+    if (S.recap && S.wrapped[S.recap]) {
+      if (e.key === 'ArrowRight') storyStep(1);
+      else if (e.key === 'ArrowLeft') storyStep(-1);
+      else if (e.key === 'Escape') closeStory();
+    } else if (S.howTo) {
+      if (e.key === 'ArrowRight') howToGo(S.howTo.index + 1);
+      else if (e.key === 'ArrowLeft') howToGo(S.howTo.index - 1);
+      else if (e.key === 'Escape') closeHowTo();
+    }
+  });
   window.addEventListener('hashchange', onHashChange);
   // Our own Wi-Fi/signal: the error bar says whose connection it is.
   window.addEventListener('offline', () => render());
@@ -274,7 +296,7 @@ function adoptLinkSession(secret, playerId) {
       existing.savedAt = Date.now();
     }
   } else {
-    S.sessions.push({ roomId: S.roomId, secret, playerId, name: playerName(playerId) || '', savedAt: Date.now() });
+    S.sessions.push(markLate({ roomId: S.roomId, secret, playerId, name: playerName(playerId) || '', savedAt: Date.now() }));
   }
   store.saveSessions(S.roomId, S.sessions);
 }
@@ -421,6 +443,11 @@ function onRoomMessage(env) {
       store.setRest(S.roomId, restText());
       // Fill in names we only knew by id (per-player links).
       for (const s of S.sessions) if (!s.name) s.name = playerName(s.playerId);
+      // A player who joined before any room had come: late or not, now we know (11/20 build).
+      if (S.sessions.some((s) => s.lateCheck)) {
+        for (const s of S.sessions) if (s.lateCheck) markLate(s);
+        store.saveSessions(S.roomId, S.sessions);
+      }
       onRoomChanged(prev, body);
       if (cameBack && prev) for (const s of S.sessions) sendHello(s.secret);
       break;
@@ -576,6 +603,13 @@ function onRoomChanged(prev, room) {
   const cardId = card ? str(card.id) : null;
   const newCard = !!prev && cardId !== S.cardId; // the first room after loading isn't "new"
   S.cardId = cardId;
+  // "How to play" (11/20 build): it opens by itself once per room while everyone waits in the
+  // lobby, and gets out of the way once the night moves on (Start, a new card).
+  if (S.howTo && ((prev && str(prev.phase) !== str(room.phase)) || newCard || !howToPages(room).length)) S.howTo = null;
+  if (!S.howTo && str(room.phase) === 'lobby' && howToPages(room).length && S.sessions.length && !store.getHowToSeen(S.roomId)) {
+    S.howTo = { index: 0, auto: true };
+    store.setHowToSeen(S.roomId);
+  }
   if (newCard) {
     lockTaps();
     if (currentView() === 'game') window.scrollTo(0, 0);
@@ -629,16 +663,12 @@ function resultSeen(r) {
 }
 
 function storeWrapped(session, w) {
-  const rec = {
-    wrapped: w,
-    name: session.name || '',
-    // showAt is leader-clock; store it on this phone's clock for tomorrow's visit.
-    localShowAt: num(w.showAt) != null ? clock.toLocal(w.showAt) : null,
-    receivedAt: Date.now(),
-  };
+  // (No `showAt` any more, 11/20: Wrapped is at the end of the game only. It stays on this page,
+  // so it can be opened again any time; an older leader's showAt is simply ignored.)
+  const rec = { wrapped: w, name: session.name || '', receivedAt: Date.now() };
   S.wrapped[session.playerId] = rec;
   store.saveWrapped(S.roomId, session.playerId, rec);
-  if (session.playerId === S.activeId) S.recap = session.playerId;
+  if (session.playerId === S.activeId) openStory(session.playerId);
   else S.unseenRecap.add(session.playerId);
 }
 
@@ -754,7 +784,7 @@ async function onJoinOk(body) {
     S.joining = null;
     S.addingPlayer = false;
     S.notice = null;
-    const session = { roomId: S.roomId, secret, playerId, name: j.name, savedAt: Date.now() };
+    const session = markLate({ roomId: S.roomId, secret, playerId, name: j.name, savedAt: Date.now() });
     const existing = S.sessions.find((s) => s.playerId === playerId);
     if (existing) {
       unsubscribe(privateChannel(existing.secret));
@@ -957,7 +987,7 @@ function setActive(pid) {
   S.flashedKey = null;
   if (S.unseenRecap.has(pid)) {
     S.unseenRecap.delete(pid);
-    S.recap = pid;
+    openStory(pid);
   }
   store.setActive(S.roomId, pid);
 }
@@ -1482,7 +1512,8 @@ const layers = {
   banner: h('div', { class: 'layer-banner' }),
   sheet: h('div', { class: 'layer-sheet' }),
   handover: h('div', { class: 'layer-handover' }), // "Jake's turn": the second after the phone switched
-  recap: h('div', { class: 'layer-recap' }),
+  howto: h('div', { class: 'layer-howto' }), // "How to play" (11/20 build)
+  recap: h('div', { class: 'layer-recap' }), // the Wrapped story
   photo: h('div', { class: 'layer-photo' }), // the Photo Proof sheet
   modal: h('div', { class: 'layer-modal' }),
   toast: h('div', { class: 'layer-toast', role: 'status', 'aria-live': 'polite' }),
@@ -1525,7 +1556,8 @@ function render() {
   renderBanner(view);
   renderSheet(view);
   renderHandover(view);
-  renderRecap(view);
+  renderHowTo(view);
+  renderStory(view);
   renderPhoto(view);
   renderModal();
   region(layers.toast, S.toast?.text || null, (t) => t && h('div', { class: 'toast', text: t }));
@@ -1640,6 +1672,10 @@ const MOUNT = {
       phase: h('div', { class: 'phase' }),
       // room.strip (Bar Crawl 11/20): "STOP 2 · The Owl", "ON THE MOVE", "TRANSIT ROUND".
       strip: h('section', { class: 'strip-wrap', 'aria-live': 'polite' }),
+      // 11/20 build: "The Table's phone is low on battery" (room.tableBattery), and a late
+      // joiner's quick rules for their first 3 cards.
+      battery: h('div', { class: 'battery-wrap', role: 'status' }),
+      rules: h('section', { class: 'rules-wrap' }),
       // "Tap anywhere to turn the chime on" (11/20 final review): sound needs a tap on iPhones. A
       // pill fixed above the sheet (it takes no room, so nothing moves when it goes mid-tap).
       unlock: h('div', { class: 'unlock-wrap' }),
@@ -1648,7 +1684,7 @@ const MOUNT = {
       'main',
       { class: 'screen game' },
       h('header', { class: 'top' }, brand(), v.phase),
-      v.strip, v.turn, v.profiles, v.stale, v.card, v.curses, v.me, v.priv, v.players, v.ticker, v.foot, v.unlock,
+      v.strip, v.battery, v.turn, v.profiles, v.stale, v.rules, v.card, v.curses, v.me, v.priv, v.players, v.ticker, v.foot, v.unlock,
     );
     return v;
   },
@@ -1787,6 +1823,12 @@ const UPDATE = {
       d[1] && h('span', { class: 'strip-text', text: d[1] })));
     V.strip.hidden = !stripData;
 
+    // The Table's battery (11/20 build, optional room.tableBattery): only sent at 15% or lower.
+    const batt = room && room.phase !== 'ended' ? num(room.tableBattery) : null;
+    region(V.battery, batt, (b) => b != null && h('div', { class: 'battery-note', 'data-testid': 'table-battery' },
+      icon('battery', 20), h('span', { text: `The Table's phone is low on battery (${Math.max(0, Math.round(b))}%). Find it a charger!` })));
+    V.battery.hidden = batt == null;
+
     // The chime is on but this page load can't make sound yet (iPhones need a tap first: after
     // Safari reloads the tab, or the per-player link opened it). Any tap anywhere fixes it, and
     // the pill goes (audioNeedsTap; never shown where the browser has no sound at all). Tapping
@@ -1819,6 +1861,14 @@ const UPDATE = {
     const rest = restText();
     region(V.stale, [showBar, mine, rest], ([show, m, r]) => show && waitingBlock(false, m, r));
     V.stale.hidden = !showBar;
+
+    // A late joiner's quick rules (11/20 build, Jackson's four lines), for their first 3 cards.
+    const late = lateRulesFor(me, room);
+    region(V.rules, late ? [howToPages(room).length > 0] : null, (d) => d && h('section', { class: 'quick-rules', 'data-testid': 'quick-rules' },
+      h('span', { class: 'quick-rules-title', text: 'Quick rules' }),
+      h('ul', { class: 'quick-rules-list' }, QUICK_RULES.map((t) => h('li', { text: t }))),
+      d[0] && h('button', { class: 'btn small', type: 'button', 'data-testid': 'quick-rules-more', onclick: () => openHowTo() }, icon('book', 18), 'How to play')));
+    V.rules.hidden = !late;
 
     renderCard(room, pid, priv);
 
@@ -1897,7 +1947,9 @@ const UPDATE = {
     ]);
     V.ticker.hidden = !ticker.length;
 
-    region(V.foot, [S.sessions.length, S.chime], ([, ch]) => [
+    const hasHowTo = howToPages(room).length > 0 && room?.phase !== 'ended';
+    region(V.foot, [S.sessions.length, S.chime, hasHowTo], ([, ch, howTo]) => [
+      howTo && h('button', { class: 'btn ghost small', type: 'button', 'data-testid': 'howto-open', onclick: () => openHowTo() }, icon('book'), 'How to play'),
       h('button', { class: 'btn ghost small', 'data-testid': 'add-player', onclick: () => { S.addingPlayer = true; S.joinMode = 'pick'; S.joining = null; render(); } }, icon('userPlus'), 'Someone sharing this phone'),
       chimeToggle(ch, true),
       h('button', { class: 'btn ghost small danger-text', 'data-testid': 'leave', onclick: confirmLeave }, icon('exit'), 'Leave game'),
@@ -1905,12 +1957,17 @@ const UPDATE = {
   },
 
   wrapped() {
+    // The Wrapped is here (11/20): its story plays over this screen; closed, it can be opened again.
     const recs = Object.entries(S.wrapped).filter(([, r]) => r && r.wrapped);
-    const now = Date.now();
-    const data = [recs.map(([id, r]) => [id, r.receivedAt, r.localShowAt != null && now >= r.localShowAt]), S.sessions.length, S.room?.phase || null];
+    const data = [recs.map(([id, r]) => [id, r.receivedAt, r.name || '']), S.sessions.length, S.room?.phase || null];
     region(V.root, data, () => [
       h('header', { class: 'top' }, brand()),
-      ...recs.map(([, r]) => wrappedCard(r, r.localShowAt != null && now >= r.localShowAt ? 'morning' : 'tonight', recs.length > 1)),
+      h('h1', { class: 'hero wrapped-hero', text: 'Your Wrapped is here.' }),
+      h('p', { class: 'lead', text: 'Your night, screen by screen. Open it again any time.' }),
+      ...recs.map(([id, r]) => h('button', {
+        class: 'btn primary big', type: 'button', 'data-testid': `wrapped-open-${id}`,
+        text: recs.length > 1 && r.name ? `Open ${r.name}'s Wrapped` : 'Open your Wrapped', onclick: () => { openStory(id); render(); },
+      })),
       S.sessions.length > 0 && h('button', {
         class: 'btn ghost big', 'data-testid': 'back-to-game',
         text: S.room && S.room.phase !== 'ended' ? 'The game is still on — back to the Table' : 'Back to the game',
@@ -1968,7 +2025,7 @@ function renderCard(room, pid, priv) {
 
   const data = {
     has: !!room, stale: S.stale, phase: str(room?.phase), leader: str(room?.leaderName),
-    ended: room?.phase === 'ended', hasRecap: !!S.wrapped[pid],
+    ended: room?.phase === 'ended', hasRecap: !!S.wrapped[pid], howTo: howToPages(room).length > 0,
     card: card && {
       id: str(card.id), kind: str(card.kind), title: str(card.title), text: str(card.text),
       level: num(card.level), accent: safeColor(card.accent, DEFAULT_ACCENT),
@@ -1988,7 +2045,8 @@ function renderCard(room, pid, priv) {
         h('div', { class: 'card-band' }, h('span', { class: 'card-kind', text: PHASES[d.phase] || titleCase(d.phase) || 'Last Call' })),
         h('div', { class: 'card-idle-body' },
           h('p', { class: 'card-text', text: d.ended ? "That's a wrap. Thanks for playing!" : 'Eyes on the Table.' }),
-          d.ended && d.hasRecap && h('button', { class: 'btn primary', text: 'See your recap', onclick: () => { S.recap = pid; render(); } }),
+          d.ended && d.hasRecap && h('button', { class: 'btn primary', 'data-testid': 'see-wrapped', text: 'See your Wrapped', onclick: () => { openStory(pid); render(); } }),
+          d.phase === 'lobby' && d.howTo && h('button', { class: 'btn primary', type: 'button', 'data-testid': 'howto-lobby', onclick: () => openHowTo() }, icon('book', 20), 'How to play'),
           !d.ended && d.leader && h('p', { class: 'card-sub', text: `${d.leader} is running the game.` })));
       if (!d.spot) return idle;
       return [
@@ -2523,29 +2581,256 @@ function armTap(el) {
   chime(); // Quick Draw is armed: a face-down phone hears it
 }
 
-// ---------- wrapped ----------
+// ---------- Wrapped: the story (11/20 build) ----------
+// Jackson 11/20: Wrapped at the end of the game only (no noon "Morning-After" comeback), and "really
+// improve how this looks": a full-screen story, one big moment per screen, tapped (right = next, the
+// left third = back) or swiped through, with a progress bar across the top. Fun first, numbers small.
+// The slides come from the Table (`wrapped.story`, protocol §wrapped); an older leader's Wrapped (or
+// one stored by an older page) has none, so the page makes a plain story from its title / stats /
+// lines. The page draws whatever slides it gets: it knows no game rules.
 
-function wrappedCard(rec, mode, showName) {
-  const w = obj(rec.wrapped);
-  const stats = arr(w.stats).map(obj).filter((s) => str(s.label));
-  return h('article', { class: `wrapped ${mode}`, 'data-testid': `wrapped-${mode}` },
-    h('div', { class: 'wr-kicker', text: mode === 'morning' ? 'Morning-After Wrapped' : "Tonight's recap" }),
-    h('h2', { class: 'wr-title', text: str(w.title) || 'Your night' }),
-    showName && rec.name && h('div', { class: 'wr-name', text: rec.name }),
-    stats.length > 0 && h('div', { class: 'wr-stats' }, stats.map((s) =>
-      h('div', { class: 'wr-stat' }, h('span', { text: s.label }), h('b', { text: str(s.value) })))),
-    arr(w.lines).map(str).filter(Boolean).map((l) => h('p', { class: 'wr-line', text: l })),
-    mode === 'tonight' && rec.localShowAt != null && Date.now() < rec.localShowAt &&
-      h('p', { class: 'wr-note', text: `Your Morning-After Wrapped unlocks ${sameDay(rec.localShowAt) ? 'at' : 'tomorrow at'} ${fmtClockTime(rec.localShowAt)}. Open this page again then.` }));
+const STORY_KINDS = ['intro', 'number', 'person', 'quote', 'list', 'photos', 'summary'];
+const STORY_YELLOW = '#FFD23F';
+// Dark slide colors become their light partner: the story stays on the yellow theme, ink text.
+const STORY_LIGHT = { '#111111': '#FF9FCE', '#9B5DE5': '#FF9FCE', '#3A86FF': '#7FD1FF', '#2EC4B6': '#7FD1FF', '#1F5FD1': '#7FD1FF' };
+const lightColor = (c, fallback) => {
+  const safe = safeColor(c, fallback);
+  return STORY_LIGHT[String(safe).toUpperCase()] || safe;
+};
+
+/** One slide, every field checked (the wire can send anything). */
+function storySlide(raw) {
+  const s = obj(raw);
+  return {
+    kind: STORY_KINDS.includes(str(s.kind)) ? str(s.kind) : 'number',
+    id: str(s.id).slice(0, 40),
+    kicker: str(s.kicker),
+    big: str(s.big),
+    title: str(s.title),
+    sticker: str(s.sticker),
+    quote: str(s.quote),
+    lines: arr(s.lines).map(str).filter(Boolean).slice(0, 8),
+    rows: arr(s.rows).map(obj).map((r) => [str(r.label), str(r.value)]).filter(([l, v]) => l || v).slice(0, 12),
+    color: lightColor(s.color, STORY_YELLOW),
+    accent: s.accent == null ? null : safeColor(s.accent, null),
+  };
 }
 
-const sameDay = (ms) => new Date(ms).toDateString() === new Date().toDateString();
+/** A stored Wrapped's screens: the Table's story, or (an older one) a plain story from its parts. */
+function storySlides(rec) {
+  const w = obj(rec && rec.wrapped);
+  const sent = arr(w.story).map(storySlide)
+    // (The photos live on the Table's phone only; a guest never gets that screen.)
+    .filter((s) => s.kind !== 'photos' && (s.kicker || s.big || s.title || s.quote || s.lines.length || s.rows.length));
+  return sent.length ? sent : olderStory(rec);
+}
 
-function renderRecap(view) {
-  const rec = view === 'game' && S.recap && S.wrapped[S.recap];
-  region(layers.recap, rec ? [S.recap, rec.receivedAt] : null, () => rec && h('div', { class: 'overlay recap' },
-    wrappedCard(rec, 'tonight', false),
-    h('button', { class: 'btn primary big', text: 'Close', onclick: () => { S.recap = null; render(); } })));
+/** An older Wrapped (title, stats, lines; no story) as a story: who, the number, the lines a few at a
+ *  time, and the tiles on the last screen. */
+function olderStory(rec) {
+  const w = obj(rec && rec.wrapped);
+  const stats = arr(w.stats).map(obj).filter((x) => str(x.label));
+  const lines = arr(w.lines).map(str).filter(Boolean);
+  const out = [storySlide({
+    kind: 'intro', id: 'intro', kicker: 'LAST CALL · WRAPPED', big: rec?.name || str(w.title) || 'Your night',
+    title: str(w.title) || "Here's your night.", sticker: 'TAP TO START', color: STORY_YELLOW, accent: '#FF5A36',
+  })];
+  const sips = stats.find((x) => /^sips taken$/i.test(str(x.label)));
+  if (sips) {
+    out.push(storySlide({ kind: 'number', id: 'you', kicker: 'YOUR NIGHT IN ONE NUMBER', big: str(sips.value),
+      title: str(sips.value) === '1' ? 'sip you took' : 'sips you took', color: '#FF5A36', accent: STORY_YELLOW }));
+  }
+  const colors = ['#FF9FCE', '#9BE564', '#7FD1FF'];
+  for (let i = 0; i < lines.length; i += 3) {
+    out.push(storySlide({ kind: 'list', id: `older-${i / 3}`, kicker: i === 0 ? 'YOUR NIGHT' : 'AND THEN…',
+      lines: lines.slice(i, i + 3), color: colors[(i / 3) % colors.length] }));
+  }
+  out.push(storySlide({ kind: 'summary', id: 'summary', kicker: 'THAT WAS YOUR NIGHT', big: str(w.title) || 'Your night',
+    sticker: 'WRAPPED', rows: stats.slice(0, 6).map((x) => ({ label: str(x.label), value: str(x.value) })),
+    color: STORY_YELLOW, accent: '#FF5A36' }));
+  return out;
+}
+
+/** Open a player's Wrapped at its first screen. */
+function openStory(pid) {
+  S.recap = pid || null;
+  S.storyIndex = 0;
+}
+
+function closeStory() {
+  S.recap = null;
+  render();
+}
+
+function storyGo(i) {
+  const rec = S.recap && S.wrapped[S.recap];
+  if (!rec) return;
+  const n = storySlides(rec).length;
+  S.storyIndex = Math.max(0, Math.min(n - 1, i));
+  render();
+}
+
+/** Right / left: the next screen, the one before. */
+const storyStep = (d) => storyGo(S.storyIndex + d);
+
+function renderStory(view) {
+  const pid = view === 'game' || view === 'wrapped' ? S.recap : null;
+  const rec = pid && S.wrapped[pid];
+  const slides = rec ? storySlides(rec) : [];
+  const i = Math.max(0, Math.min(S.storyIndex, slides.length - 1));
+  const who = rec && sharedPhone() ? rec.name || sessionName(S.sessions.find((x) => x.playerId === pid)) : '';
+  region(layers.recap, rec ? [pid, rec.receivedAt, i, slides.length, who] : null, () => {
+    if (!rec || !slides.length) return null;
+    const s = slides[i];
+    const last = i === slides.length - 1;
+    const el = h('div', {
+      class: `overlay story kind-${s.kind}`, role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Your Wrapped',
+      'data-testid': 'wrapped-story', 'data-slide': s.id || s.kind, 'data-index': String(i),
+      style: { '--story-bg': s.color, '--story-accent': s.accent || 'var(--ink)', '--story-accent-text': s.accent ? 'var(--ink)' : 'var(--surface)' },
+    },
+    h('div', { class: 'story-progress', 'aria-hidden': 'true' }, slides.map((_, k) => h('i', { class: k <= i ? 'on' : null }))),
+    h('div', { class: 'story-top' },
+      h('span', { class: 'story-brand', text: 'Last Call · Wrapped' }),
+      h('span', { class: 'story-count', text: `${i + 1} / ${slides.length}` }),
+      h('button', { class: 'btn small story-close', type: 'button', 'data-testid': 'story-close', text: 'Close', onclick: closeStory })),
+    who && h('div', { class: 'story-who', text: `${who}'s Wrapped` }),
+    h('div', { class: 'story-body', 'data-testid': 'story-body' },
+      s.kicker && h('span', { class: 'story-kicker', text: s.kicker }),
+      s.sticker && h('span', { class: 'story-sticker', text: s.sticker }),
+      s.big && h('h2', {
+        class: `story-big${s.big.length <= 6 ? ' huge' : ''}`, 'data-testid': 'story-big', text: s.big,
+        style: { '--fit': String(longestWord(s.big)) },
+      }),
+      s.title && h('p', { class: 'story-title', text: s.title }),
+      s.quote && h('blockquote', { class: 'story-quote', 'data-testid': 'story-quote' }, h('span', { class: 'story-quote-band', 'aria-hidden': 'true' }), h('p', { text: s.quote })),
+      s.lines.length > 0 && h('div', { class: 'story-lines' }, s.lines.map((l) => h('p', { text: l }))),
+      s.rows.length > 0 && h('ul', { class: 'story-rows' }, s.rows.map(([l, v]) =>
+        h('li', { class: 'story-row' }, l && h('b', { text: l }), v && h('span', { text: v }))))),
+    h('div', { class: 'story-foot' },
+      last
+        ? [
+          h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'story-done', text: 'Close', onclick: closeStory }),
+          h('button', { class: 'btn small', type: 'button', 'data-testid': 'story-again', text: 'See it again', onclick: () => storyGo(0) }),
+        ]
+        : [
+          h('button', { class: 'btn small', type: 'button', 'data-testid': 'story-back', text: 'Back', disabled: i === 0, onclick: () => storyStep(-1) }),
+          h('span', { class: 'story-hint', text: i === 0 ? 'Tap to start' : 'Tap for more' }),
+          h('button', { class: 'btn small story-next', type: 'button', 'data-testid': 'story-next', text: 'Next', onclick: () => storyStep(1) }),
+        ]));
+    // Tap anywhere (not a button): the left third goes back, the rest goes on.
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('button')) return;
+      const box = el.getBoundingClientRect();
+      storyStep(e.clientX - box.left < box.width * 0.3 ? -1 : 1);
+    });
+    swipeable(el, storyStep);
+    return el;
+  });
+}
+
+/** Left / right swipes on `el` call step(+1) / step(-1). */
+function swipeable(el, step) {
+  let x0 = null;
+  let y0 = null;
+  el.addEventListener('touchstart', (e) => { x0 = e.touches[0]?.clientX ?? null; y0 = e.touches[0]?.clientY ?? null; }, { passive: true });
+  el.addEventListener('touchend', (e) => {
+    if (x0 == null) return;
+    const t = e.changedTouches[0];
+    const dx = (t?.clientX ?? x0) - x0;
+    const dy = (t?.clientY ?? y0) - y0;
+    x0 = null;
+    if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy)) {
+      e.preventDefault(); // a swipe isn't also a tap
+      step(dx < 0 ? 1 : -1);
+    }
+  });
+}
+
+// ---------- How to play (11/20 build) ----------
+// The Table sends tonight's pages in the room (`room.howTo`, optional): only the parts that are on.
+// They open by themselves once per room while everyone waits in the lobby (Skip any time), and again
+// from "How to play" (the lobby card, the foot, a late joiner's quick rules). An older leader sends
+// none: no walkthrough.
+
+/** Tonight's pages from the room, every field checked. */
+function howToPages(room) {
+  return arr(room?.howTo).map(obj)
+    .map((p) => ({ id: str(p.id).slice(0, 40), title: str(p.title), lines: arr(p.lines).map(str).filter(Boolean).slice(0, 6), color: lightColor(p.color, STORY_YELLOW) }))
+    .filter((p) => p.title && p.lines.length);
+}
+
+function openHowTo() {
+  if (!howToPages(S.room).length) return;
+  S.howTo = { index: 0, auto: false };
+  render();
+}
+
+function closeHowTo() {
+  S.howTo = null;
+  store.setHowToSeen(S.roomId);
+  render();
+}
+
+function howToGo(i) {
+  const n = howToPages(S.room).length;
+  if (!S.howTo || !n) return;
+  if (i >= n) return closeHowTo();
+  S.howTo.index = Math.max(0, i);
+  render();
+}
+
+function renderHowTo(view) {
+  const pages = view === 'game' && S.howTo ? howToPages(S.room) : [];
+  const i = pages.length ? Math.max(0, Math.min(S.howTo.index, pages.length - 1)) : 0;
+  region(layers.howto, pages.length ? [pages, i] : null, () => {
+    if (!pages.length) return null;
+    const p = pages[i];
+    const last = i === pages.length - 1;
+    const el = h('div', {
+      class: 'overlay howto', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How to play',
+      'data-testid': 'howto', 'data-page': p.id, 'data-index': String(i), style: { '--howto-bg': p.color },
+    },
+    h('div', { class: 'howto-top' },
+      h('span', { class: 'howto-count', text: `How to play · ${i + 1} of ${pages.length}` }),
+      h('button', { class: 'btn small', type: 'button', 'data-testid': 'howto-skip', text: 'Skip', onclick: closeHowTo })),
+    h('div', { class: 'howto-body' },
+      h('h2', { class: 'howto-title', 'data-testid': 'howto-title', text: p.title, style: { '--fit': String(longestWord(p.title)) } }),
+      h('ol', { class: 'howto-lines' }, p.lines.map((l, k) => h('li', {}, h('b', { class: 'howto-n', text: String(k + 1) }), h('span', { text: l }))))),
+    h('div', { class: 'howto-dots', 'aria-hidden': 'true' }, pages.map((_, k) => h('i', { class: k === i ? 'on' : null }))),
+    h('div', { class: 'howto-foot' },
+      i > 0 && h('button', { class: 'btn small', type: 'button', 'data-testid': 'howto-back', text: 'Back', onclick: () => howToGo(i - 1) }),
+      h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'howto-next', text: last ? "Let's play" : 'Next', onclick: () => howToGo(i + 1) })),
+    h('p', { class: 'howto-note', text: 'Phone locked? Just open this page again.' }));
+    swipeable(el, (d) => howToGo(i + d));
+    return el;
+  });
+}
+
+// ---------- A late joiner's quick rules (11/20 build) ----------
+// Jackson's four lines, for anyone who joins once the cards have started, for their first 3 cards
+// (the cards dealt from when they got in). The page decides this on its own (any leader works).
+
+const QUICK_RULES = ['Do it, or pay the tax.', 'Owe is your tab.', 'Bank is sips you can give away.', 'Phone locked? Reopen this page.'];
+const QUICK_RULES_CARDS = 3;
+const PLAYING = ['warmup', 'main', 'lastcall'];
+
+/** A player who just got in on this page: late (the cards are going) or not. No room yet: decide
+ *  at the first one. Returns the session. */
+function markLate(session) {
+  if (!S.room) {
+    session.lateCheck = true;
+    return session;
+  }
+  delete session.lateCheck;
+  if (PLAYING.includes(str(S.room.phase))) session.lateUntil = num(S.room.cardCount, 0) + QUICK_RULES_CARDS;
+  return session;
+}
+
+/** Show the quick rules to this player now? */
+function lateRulesFor(session, room) {
+  if (!session || !room || !PLAYING.includes(str(room.phase))) return false;
+  const until = num(session.lateUntil);
+  return until != null && num(room.cardCount, 0) < until;
 }
 
 // ---------- Photo Proof sheet ----------
