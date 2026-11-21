@@ -9,23 +9,33 @@ export const PROTOCOL_VERSION = 1;
 const ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const PLAYER_ID_RE = /^[A-Za-z0-9_:.-]{1,64}$/;
 
+// The Table's public key (11/20 security): base64url of a compressed (33 bytes = 44 chars) or raw
+// (65 bytes = 87 chars) P-256 point. crypto.js checks it really is one.
+const LEADER_KEY_RE = /^[A-Za-z0-9_-]{43,88}$/;
+
 export const isRoomId = (s) => typeof s === 'string' && ID_RE.test(s);
 export const isSecret = isRoomId;
 export const isPlayerId = (s) => typeof s === 'string' && PLAYER_ID_RE.test(s);
+export const isLeaderKey = (s) => typeof s === 'string' && LEADER_KEY_RE.test(s);
 
-/** Reads `#r=<roomId>[&s=<secret>&p=<playerId>]`. Invalid parts come back as null. */
+/**
+ * Reads `#r=<roomId>[&s=<secret>&p=<playerId>][&k=<the Table's public key>]`. Invalid parts come
+ * back as null. `k` (11/20 security) only counts with a room: it's that room's Table.
+ */
 export function parseFragment(hash) {
-  const out = { r: null, s: null, p: null };
+  const out = { r: null, s: null, p: null, k: null };
   if (typeof hash !== 'string' || hash.length < 2) return out;
   const params = new URLSearchParams(hash.replace(/^#/, ''));
   const r = params.get('r');
   const s = params.get('s');
   const p = params.get('p');
+  const k = params.get('k');
   if (isRoomId(r)) out.r = r;
   if (out.r && isSecret(s) && isPlayerId(p)) {
     out.s = s;
     out.p = p;
   }
+  if (out.r && isLeaderKey(k)) out.k = k;
   return out;
 }
 

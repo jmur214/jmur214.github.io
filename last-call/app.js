@@ -11,7 +11,9 @@
 
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 import { createTransport } from './transport.js';
-import { generateJoinKeyPair, exportPublicKey, openJoinReply, randomId } from './crypto.js';
+import {
+  generateJoinKeyPair, exportPublicKey, openJoinReply, randomId, importLeaderKey, verifyLeaderEnvelope,
+} from './crypto.js';
 import {
   parseFragment, roomChannel, privateChannel, makeEnvelope, isEnvelope, SeqTracker, LeaderClock,
 } from './protocol.js';
@@ -163,7 +165,17 @@ const S = {
   // sheet was open, so the report goes on THEIR channel, not the phone owner's.
   hiddenFor: null,
   resultSeq: 0, // numbers each prompt_close result (its tap-to-see key)
+  // The Table's public key for this room (11/20 security), from the QR / link's `k` (or remembered
+  // for the room): { k, key: Promise<CryptoKey | null>, lastAt, lastSeq }. null = no `k` (an older
+  // QR / older Table): the room channel is believed as before. See checkLeader.
+  leader: null,
+  roomInbox: Promise.resolve(), // signed room messages are checked one after another, in order
 };
+
+// What the signature check did (debugging only; nothing on screen): `dropped` = messages on the
+// room channel that claimed to be the Table and weren't (a prank, a replay, junk).
+const SIG = { verified: 0, dropped: 0, unchecked: 0, last: null };
+globalThis.__lcSig = SIG;
 
 const clock = new LeaderClock();
 const seqs = new SeqTracker(); // leader seq per channel
@@ -208,6 +220,10 @@ function boot() {
   if (roomId) {
     S.roomId = roomId;
     if (frag.r) store.setLastRoom(roomId);
+    // The Table's public key (11/20 security): from this link, else the one remembered for the
+    // room (the fragment is wiped above, so a reload must still know it). None: as before.
+    if (frag.k) store.setLeaderKey(roomId, frag.k);
+    useLeaderKey(frag.k || store.getLeaderKey(roomId));
     S.sessions = store.loadSessions(roomId);
     S.wrapped = store.loadWrapped(roomId);
     if (frag.s) adoptLinkSession(frag.s, frag.p);
@@ -279,6 +295,10 @@ function onHashChange() {
     return;
   }
   history.replaceState(history.state, '', location.pathname + location.search);
+  if (frag.k) {
+    store.setLeaderKey(S.roomId, frag.k); // a newer link's key replaces the one remembered
+    useLeaderKey(frag.k);
+  }
   if (!frag.s) return; // the room QR again: nothing new
   const known = S.sessions.some((s) => s.playerId === frag.p && s.secret === frag.s);
   adoptLinkSession(frag.s, frag.p);
@@ -421,7 +441,65 @@ function sendBeats() {
 const pageVisible = () => document.visibilityState !== 'hidden';
 const nightOver = () => S.room?.phase === 'ended';
 
+/**
+ * Everything on the room channel lands here. With the Table's key for this room (`k`, 11/20
+ * security), a message that claims to be the Table is believed only once its signature checks out
+ * (checkLeader), one after another in arrival order. Without a key: exactly as before.
+ */
 function onRoomMessage(env) {
+  if (!S.leader) return handleRoomMessage(env);
+  if (!isEnvelope(env) || env.from !== 'leader') return; // other guests' join/ping, junk
+  S.roomInbox = S.roomInbox
+    .then(() => checkLeader(env))
+    .then((ok) => ok && handleRoomMessage(env))
+    .catch((err) => console.error('[last-call] room message', err));
+  return undefined;
+}
+
+/** Check the room channel against the Table's public key `k` from now on (null / same: no change). */
+function useLeaderKey(k) {
+  if (!k || (S.leader && S.leader.k === k)) return;
+  S.leader = {
+    k,
+    // A browser that can't read the key (no BigInt or no ECDSA) can't check anything, so it carries
+    // on as before rather than shutting the Table out.
+    key: importLeaderKey(k).catch((err) => {
+      console.warn('[last-call] could not read the Table key', err);
+      return null;
+    }),
+    lastAt: -Infinity,
+    lastSeq: -Infinity,
+  };
+}
+
+/**
+ * Is this room-channel message really from the Table? Its `sig` must verify against `k` for THIS
+ * room (the signed bytes bind the room id, type, seq, time and body), and it must be newer than the
+ * last one believed (leader-clock `at`, then `seq`), so a genuine message recorded earlier and
+ * played again (an old card, an old buzz) is dropped too. Drops are quiet: counted in SIG only.
+ */
+async function checkLeader(env) {
+  const lead = S.leader;
+  const key = lead && (await lead.key);
+  if (!key) {
+    SIG.unchecked++;
+    return true;
+  }
+  const drop = (why) => {
+    SIG.dropped++;
+    SIG.last = `${why}: ${env.t}`;
+    return false;
+  };
+  if (!(await verifyLeaderEnvelope(key, S.roomId, env))) return drop('bad signature');
+  if (S.leader !== lead) return drop('the key changed');
+  if (!(env.at > lead.lastAt || (env.at === lead.lastAt && env.seq > lead.lastSeq))) return drop('replayed');
+  lead.lastAt = env.at;
+  lead.lastSeq = env.seq;
+  SIG.verified++;
+  return true;
+}
+
+function handleRoomMessage(env) {
   if (!isEnvelope(env) || env.from !== 'leader') return; // other guests' join/ping, junk
   clock.sample(env.at);
   const gap = seqs.check(roomChannel(S.roomId), env.seq);

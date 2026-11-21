@@ -14,11 +14,13 @@
 //   lc.chime              true / false: "Chime when it's my turn" (every game; on unless turned off)
 //   lc.rest.<roomId>      { text, at }: the last `room.rest` line (Bar Crawl: walking between bars),
 //                         so a page opened mid-walk reads as resting before any room arrives. 2 h.
+//   lc.key.<roomId>       { k, savedAt }: the Table's public key from the QR / link (11/20 security),
+//                         so a reload or a reopened tab still checks the Table's signature. A week.
 //
 // And in sessionStorage (this tab only, gone when the tab closes):
 //   lc.draft.<roomId>.<playerId>.<promptId>   what's typed in a text prompt, until it's sent
 
-import { isRoomId, isSecret, isPlayerId } from './protocol.js';
+import { isRoomId, isSecret, isPlayerId, isLeaderKey } from './protocol.js';
 
 const KEEP_MS = 7 * 24 * 3600 * 1000; // forget games older than a week
 const REST_KEEP_MS = 2 * 3600 * 1000; // a resting line older than 2 hours means nothing any more
@@ -81,6 +83,19 @@ export function saveSessions(roomId, sessions) {
       lateCheck: s.lateCheck === true ? true : undefined,
     })),
   );
+}
+
+// ---------- the Table's public key (11/20 security) ----------
+
+/** The Table's public key `k` this page was given for the room (by its QR or a link), or null. */
+export function getLeaderKey(roomId) {
+  const r = read(`lc.key.${roomId}`, null);
+  return r && isLeaderKey(r.k) ? r.k : null;
+}
+
+/** Remember the room's `k`. A newer link's `k` replaces it (it came from the Table's own screen). */
+export function setLeaderKey(roomId, k) {
+  if (roomId && isLeaderKey(k)) write(`lc.key.${roomId}`, { k, savedAt: Date.now() });
 }
 
 // ---------- How to play (11/20 build) ----------
@@ -174,6 +189,9 @@ export function prune(now = Date.now()) {
         remove(k);
         remove(k.replace('lc.session.', 'lc.active.'));
       } else if (fresh.length !== list.length) write(k, fresh);
+    } else if (k.startsWith('lc.key.')) {
+      const r = read(k, null);
+      if (!r || typeof r.savedAt !== 'number' || now - r.savedAt >= KEEP_MS) remove(k);
     } else if (k.startsWith('lc.howto.')) {
       const r = read(k, null);
       if (!r || typeof r.at !== 'number' || now - r.at >= KEEP_MS) remove(k);
