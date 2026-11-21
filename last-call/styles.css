@@ -631,6 +631,17 @@ section.me:empty { display: none; }
   border-radius: 24px; border: 3px dashed var(--ink); background: var(--surface); font-size: 22px; font-weight: 800;
 }
 .tap-wait b { font-size: 48px; line-height: 1; }
+/* Quick Draw with false starts (11/20): the waiting box is a button, the size of the TAP that
+   replaces it, so a touch on it is plainly a false start. */
+.tap-wait.early-target { width: 100%; min-height: 190px; font: inherit; font-size: 22px; font-weight: 800; color: var(--ink); cursor: pointer; padding: 12px; }
+.tap-wait.early-target:active { background: var(--bg); }
+.tap-warn { font-size: 15px; font-weight: 700; max-width: 30ch; text-align: center; }
+.tap-false {
+  min-height: 100px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+  border-radius: 24px; border: var(--border); background: var(--dare); padding: 12px; text-align: center;
+  font-size: 17px; font-weight: 700;
+}
+.tap-false b { font-size: 34px; font-weight: 800; }
 .tap-done {
   min-height: 100px; display: grid; place-items: center; border-radius: 24px; border: var(--border);
   background: var(--green); font-size: 30px; font-weight: 800;

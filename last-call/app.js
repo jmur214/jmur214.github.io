@@ -37,6 +37,9 @@ const RESULT_MS = 4500; // how long a prompt_close result stays up
 // then stays this long.
 const SECRET_RESULT_MS = 20000;
 const TAP_LOCK_MS = 1000; // after a new card, its buttons ignore taps this long (a double tap can't hit them)
+// A tap on a Quick Draw's WAITING box (only when the prompt says `falseStart`, 11/20) answers this
+// instead of "tap": a false start, which loses the race (the Table decides what that costs).
+const FALSE_START = 'early';
 // The prompt kinds this page can answer. Anything else (a newer Table's kind) is display-only:
 // "Look at the Table for this one." It never moves or holds a shared phone (11/20 final review).
 const ANSWERABLE_KINDS = ['choose', 'vote', 'tap', 'number', 'text'];
@@ -2260,7 +2263,10 @@ function renderSheet(view) {
     for (const s of S.sessions) {
       if (s.playerId === pid) continue;
       for (const e of S.prompts[s.playerId]?.values() || []) {
-        if (str(e.p.kind) === 'tap' && e.answered === undefined && !isExpired(e.p)) items.push({ owner: s.playerId, e });
+        // (11/20: their box stays for the race once they've gone too, so "Sam: False start!"
+        // is there for everyone to see, not gone the moment he touched it.)
+        const raceOn = S.sessions.some((o) => S.prompts[o.playerId]?.get(e.p.id)?.answered === undefined);
+        if (str(e.p.kind) === 'tap' && !isExpired(e.p) && (e.answered === undefined || raceOn)) items.push({ owner: s.playerId, e });
       }
     }
     items.sort((a, b) => b.e.receivedAt - a.e.receivedAt);
@@ -2454,14 +2460,33 @@ function buildPrompt(pid, entry, opts = {}) {
       }))));
   } else if (kind === 'tap') {
     const arm = num(p.armAt);
-    if (answered) {
+    if (answered && entry.answered === FALSE_START) {
+      // 11/20: they tapped the waiting box. Out of the race, and it says so plainly.
       el.classList.add('armed');
-      fs.append(h('div', { class: 'tap-zone' }, h('div', { class: 'tap-done', text: 'Tapped!' })));
+      fs.append(h('div', { class: 'tap-zone' }, h('div', { class: 'tap-false', 'data-testid': 'false-start' },
+        h('b', { text: opts.named ? `${who}: False start!` : 'False start!' }),
+        h('span', { text: 'Tapped before the button. That loses this one.' }))));
+    } else if (answered) {
+      el.classList.add('armed');
+      fs.append(h('div', { class: 'tap-zone' }, h('div', { class: 'tap-done', text: opts.named ? `${who}: tapped!` : 'Tapped!' })));
     } else {
-      fs.append(h('div', { class: 'tap-zone' },
-        h('div', { class: 'tap-wait' },
-          h('span', { text: 'Get ready…' }),
-          arm != null && h('b', { 'data-ends-at': String(arm) }))));
+      // A race with false starts (Quick Draw, 11/20: "we should also be penalized (lose) if
+      // someone clicks when it's too early"): the whole waiting box is the tap target, the same
+      // place the TAP button lands, so a touch on it is unmistakably a false start. A click, not
+      // a pointerdown, so scrolling the sheet never counts. Without the flag (Bank Heist, an
+      // older Table) the wait isn't tappable.
+      const early = p.falseStart === true;
+      const kids = [
+        h('span', { text: opts.named ? `${who}: get ready…` : 'Get ready…' }),
+        arm != null && h('b', { 'data-ends-at': String(arm) }),
+        early && h('span', { class: 'tap-warn', text: "Don't touch until it says TAP! A tap now is a false start: you lose." }),
+      ];
+      fs.append(h('div', { class: 'tap-zone' }, early
+        ? h('button', {
+          class: 'tap-wait early-target', type: 'button', 'data-testid': 'tap-wait',
+          onclick: () => answer(pid, p.id, FALSE_START, 'False start'),
+        }, kids)
+        : h('div', { class: 'tap-wait', 'data-testid': 'tap-wait' }, kids)));
     }
     el.dataset.armAt = String(arm ?? 0);
   } else if (kind === 'number') {
