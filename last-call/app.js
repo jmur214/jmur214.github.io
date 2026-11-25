@@ -1963,7 +1963,7 @@ const UPDATE = {
     // Curses: sticker tags. A curse on you is purple; curses on others / everyone are white.
     const curses = arr(room?.curses).map(obj).filter((c) => str(c.text));
     region(V.curses, [curses.map((c) => [c.id, c.text, c.who, num(c.cardsLeft)]), pid], ([list, me]) => !list.length ? [] : [
-      h('h2', { class: 'section-label', text: list.length > 1 ? `${list.length} curses active` : 'Curse active' }),
+      h('h2', { class: 'section-label', text: list.length > 1 ? `${list.length} rules in play` : 'Rule in play' }),
       h('ul', { class: 'curse-list' }, list.map(([, text, who, left]) =>
         h('li', { class: `curse${me && who === me ? ' mine' : ''}` },
           h('span', { class: 'curse-text', text }),
