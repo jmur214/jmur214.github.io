@@ -441,6 +441,14 @@ section.me:empty { display: none; }
 .sec-actions .btn.act { box-shadow: 4px 4px 0 var(--bg); }
 
 .actions { display: flex; flex-direction: column; gap: 14px; }
+/* 11/24: what to do NOW, straight under the card. */
+.now-wrap { display: flex; flex-direction: column; gap: 14px; }
+.now-wrap[hidden] { display: none; }
+.watch-note { margin: 0; text-align: center; font-size: 17px; font-weight: 700; color: var(--ink-muted, #5b5140); }
+/* Everything that isn't this card or the tab / Bank: smaller, two to a row. */
+.actions.more { flex-direction: row; flex-wrap: wrap; gap: 10px; align-items: center; }
+.actions.more .more-label { flex-basis: 100%; font-size: 13px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.actions.more .btn.act { width: auto; flex: 1 1 calc(50% - 10px); min-height: 48px; font-size: 16px; border-radius: 14px; }
 .btn.act { width: 100%; min-height: 64px; font-size: 21px; border-radius: 18px; }
 .btn.act.primary { min-height: 76px; font-size: 24px; border-radius: 20px; }
 
@@ -805,7 +813,13 @@ section.me:empty { display: none; }
 .howto-dots { display: flex; justify-content: center; gap: 6px; }
 .howto-dots i { width: 8px; height: 8px; border-radius: 999px; background: rgba(17, 17, 17, .22); }
 .howto-dots i.on { width: 22px; background: var(--ink); }
-.howto-foot { display: flex; gap: 10px; align-items: stretch; }
+.howto-foot {
+  display: flex; gap: 10px; align-items: stretch;
+  /* 11/24: Back / Next stay on screen however long the page is (on page 1 they had fallen
+     below the bottom of a phone, leaving only "Skip" in view). */
+  position: sticky; bottom: 0; z-index: 1; padding: 10px 0 max(10px, env(safe-area-inset-bottom));
+  background: var(--howto-bg, var(--bg));
+}
 .howto-foot .btn.big { flex: 1; }
 .howto-foot .btn.small { min-height: 72px; }
 .howto-note { text-align: center; font-size: 14px; font-weight: 700; color: var(--soft); }

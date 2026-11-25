@@ -838,7 +838,7 @@ function confirmMove(playerId, name) {
   const leader = str(S.room?.leaderName) || 'The leader';
   openModal({
     title: `Move ${name} to this phone?`,
-    text: `${leader} gets asked on their phone. Once they say yes, ${name}'s old phone stops working. Owe and Bank come with you.`,
+    text: `${leader} gets asked on their phone. Once they say yes, ${name}'s old phone stops working. Your tab and Bank come with you.`,
     buttons: [
       { label: 'Cancel', style: 'ghost' },
       { label: 'Move me', style: 'primary', run: () => startJoin(name, playerId, { move: true }) },
@@ -1107,7 +1107,7 @@ function confirmLeave() {
   openModal({
     title: 'Leave the game?',
     // The leader's phone sits them out (no cards, no votes, no interest) until they rejoin.
-    text: `${s.name || 'You'} will sit out: no more cards until you come back. Your Owe and Bank wait for you.`,
+    text: `${s.name || 'You'} will sit out: no more cards until you come back. Your tab and Bank wait for you.`,
     buttons: [
       { label: 'Stay', style: 'ghost' },
       { label: 'Leave', style: 'danger', run: () => leave(s.playerId) },
@@ -1746,6 +1746,11 @@ const MOUNT = {
       turn: h('section', { class: 'turn-wrap', 'aria-live': 'polite' }),
       stale: h('div', { class: 'stale-bar', role: 'status' }),
       card: h('section', { class: 'card-wrap', 'aria-live': 'polite' }),
+      // 11/24 (Jackson: "the app should put the things in front of them they need to do or
+      // see"): what to do NOW sits straight under the card: this card's buttons (I did it /
+      // Refuse), a fresh "DRINK NOW" and its "Put it on my tab". They used to come after the
+      // curses, Owe / Bank and every private box, so Refuse was below the fold.
+      now: h('section', { class: 'now-wrap', 'aria-live': 'polite' }),
       curses: h('section', { class: 'curses' }),
       me: h('section', { class: 'me' }),
       priv: h('section', { class: 'private' }),
@@ -1767,7 +1772,7 @@ const MOUNT = {
       'main',
       { class: 'screen game' },
       h('header', { class: 'top' }, brand(), v.phase),
-      v.strip, v.battery, v.turn, v.profiles, v.stale, v.rules, v.card, v.curses, v.me, v.priv, v.players, v.ticker, v.foot, v.unlock,
+      v.strip, v.battery, v.turn, v.profiles, v.stale, v.card, v.now, v.rules, v.curses, v.me, v.priv, v.players, v.ticker, v.foot, v.unlock,
     );
     return v;
   },
@@ -1978,7 +1983,7 @@ const UPDATE = {
     region(V.me, [sessionName(me), owe, oweText, bank, meter], ([name, o, ot, b, m]) => [
       h('div', { class: 'me-name' }, h('span', { class: 'dim', text: 'You are' }), h('b', { text: name })),
       h('div', { class: 'me-stats' },
-        h('div', { class: `stat owe${o > 0 ? ' hot' : ''}`, 'data-testid': 'owe' }, h('span', { class: 'stat-l', text: 'Owe' }),
+        h('div', { class: `stat owe${o > 0 ? ' hot' : ''}`, 'data-testid': 'owe' }, h('span', { class: 'stat-l', text: 'Tab' }),
           h('span', { class: `stat-n${ot !== String(o) ? ' words' : ''}`, text: ot })),
         h('div', { class: 'stat bank', 'data-testid': 'bank' }, h('span', { class: 'stat-l', text: 'Bank' }), h('span', { class: 'stat-n', text: String(b) }))),
       drinkMeterLine(m),
@@ -2002,10 +2007,36 @@ const UPDATE = {
     const pressed = allActions.filter((a) => S.pressed[`${pid}:${a.id}`] > now).map((a) => a.id);
     const locked = tapsLocked();
     const held = allActions.filter((a) => S.queued[`${pid}:${a.id}`]).map((a) => a.id); // (actionButton reads S.queued)
-    region(V.priv, [pid, sections, peeked, allActions, pressed, locked, held], () => [
-      sections.length > 0 && h('div', { class: 'sections' }, sections.map((s) =>
+    // NOW: this card's buttons, a charge that just landed ("DRINK NOW" + its "Put it on my
+    // tab"), the lie detector's Refuse. EVERYDAY: the tab and the Bank. MORE: everything else
+    // (loans, Pacts, roles' powers…), drawn small so it doesn't read as "do this".
+    const isNow = (a) => a.id.startsWith('card:') || a.id.startsWith('tab@') || a.id === 'polygraph:refuse';
+    const EVERYDAY = ['drank', 'drank:one', 'handout'];
+    const nowSections = sections.filter((s) => s.id === NOW_SECTION);
+    const restSections = sections.filter((s) => s.id !== NOW_SECTION);
+    const nowActions = actions.filter(isNow);
+    const mainActions = actions.filter((a) => !isNow(a) && EVERYDAY.includes(a.id));
+    const moreActions = actions.filter((a) => !isNow(a) && !EVERYDAY.includes(a.id));
+    // A card is up and it isn't yours: say so, so nobody hunts for buttons.
+    const cardUp = !!(room && room.card) && ['warmup', 'main', 'lastcall'].includes(str(room.phase));
+    const cardIsMine = !!currentSpotlight(room, pid, priv) || nowActions.some((a) => a.id.startsWith('card:'));
+    // Only for a card that names other people: an "everyone" card, a team card or a vote is
+    // everybody's, so it never gets the note.
+    const named = arr(obj(room?.card).targets);
+    const watching = cardUp && !cardIsMine && named.length > 0 && !named.includes(pid) && !(S.prompts[pid]?.size > 0);
+    region(V.now, [pid, nowSections, nowActions, pressed, locked, held, watching], () => [
+      nowSections.length > 0 && h('div', { class: 'sections' }, nowSections.map((s) => renderSection(pid, s, false, [], pressed, locked))),
+      nowActions.length > 0 && h('div', { class: 'actions' }, nowActions.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false))),
+      watching && h('p', { class: 'watch-note', 'data-testid': 'not-your-card', text: 'Not your card. Watch.' }),
+    ]);
+    V.now.hidden = !(nowSections.length || nowActions.length || watching);
+    region(V.priv, [pid, restSections, peeked, allActions, pressed, locked, held], () => [
+      restSections.length > 0 && h('div', { class: 'sections' }, restSections.map((s) =>
         renderSection(pid, s, peeked.includes(s.id), allActions.filter((a) => homeOf(a) === s.id), pressed, locked))),
-      actions.length > 0 && h('div', { class: 'actions' }, actions.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false))),
+      mainActions.length > 0 && h('div', { class: 'actions' }, mainActions.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false))),
+      moreActions.length > 0 && h('div', { class: 'actions more' },
+        h('span', { class: 'more-label', text: 'More' }),
+        moreActions.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false))),
     ]);
 
     // Players strip
@@ -2016,7 +2047,7 @@ const UPDATE = {
         h('li', { class: `pl${p.id === active ? ' me' : ''}${p.online === false ? ' off' : ''}`, 'data-pl': p.id },
           h('div', { class: 'pl-name', text: str(p.name) || '?' }),
           h('div', { class: 'pl-nums' },
-            h('span', { class: 'pl-owe', text: `Owe ${drinkAmountShort(num(p.owe, 0), perDrink, shots)}` }),
+            h('span', { class: 'pl-owe', text: `Tab ${drinkAmountShort(num(p.owe, 0), perDrink, shots)}` }),
             h('span', { class: 'pl-bank', text: `Bank ${num(p.bank, 0)}` })),
           arr(p.badges).length > 0 && h('div', { class: 'pl-badges' }, arr(p.badges).map((b) => h('span', { class: 'pill', text: str(b) })))))),
     ]);
@@ -2916,7 +2947,9 @@ function renderHowTo(view) {
 // (the cards dealt from when they got in). The page decides this on its own (any leader works).
 
 // (11/24 review: the second line was added; people with no buttons thought their phone was broken.)
-const QUICK_RULES = ['Do it, or pay the tax.', 'No buttons? It\u2019s not your card.', 'Owe is your tab.', 'Bank is sips you can give away.', 'Phone locked? Reopen this page.'];
+// The Table's "DRINK NOW: 3 sips" box (sips that just landed on this player).
+const NOW_SECTION = 'drinknow';
+const QUICK_RULES = ['Do it, or refuse and drink.', 'No buttons? It\u2019s not your card.', 'Tab is sips you put off.', 'Bank is sips you can give away.', 'Phone locked? Reopen this page.'];
 const QUICK_RULES_CARDS = 3;
 const PLAYING = ['warmup', 'main', 'lastcall'];
 
