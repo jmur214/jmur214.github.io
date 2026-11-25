@@ -686,7 +686,9 @@ function onRoomChanged(prev, room) {
   S.cardId = cardId;
   // "How to play" (11/20 build): it opens by itself once per room while everyone waits in the
   // lobby, and gets out of the way once the night moves on (Start, a new card).
-  if (S.howTo && ((prev && str(prev.phase) !== str(room.phase)) || newCard || !howToPages(room).length)) S.howTo = null;
+  // A new card closes the how-to only when it opened by itself. One a guest opened by hand
+  // stays put (and keeps its page): a late joiner could never finish it otherwise (11/24 review).
+  if (S.howTo && ((prev && str(prev.phase) !== str(room.phase)) || (newCard && S.howTo.auto) || !howToPages(room).length)) S.howTo = null;
   if (!S.howTo && str(room.phase) === 'lobby' && howToPages(room).length && S.sessions.length && !store.getHowToSeen(S.roomId)) {
     S.howTo = { index: 0, auto: true };
     store.setHowToSeen(S.roomId);
@@ -2913,7 +2915,8 @@ function renderHowTo(view) {
 // Jackson's four lines, for anyone who joins once the cards have started, for their first 3 cards
 // (the cards dealt from when they got in). The page decides this on its own (any leader works).
 
-const QUICK_RULES = ['Do it, or pay the tax.', 'Owe is your tab.', 'Bank is sips you can give away.', 'Phone locked? Reopen this page.'];
+// (11/24 review: the second line was added; people with no buttons thought their phone was broken.)
+const QUICK_RULES = ['Do it, or pay the tax.', 'No buttons? It\u2019s not your card.', 'Owe is your tab.', 'Bank is sips you can give away.', 'Phone locked? Reopen this page.'];
 const QUICK_RULES_CARDS = 3;
 const PLAYING = ['warmup', 'main', 'lastcall'];
 
