@@ -2014,7 +2014,7 @@ const UPDATE = {
     const EVERYDAY = ['drank', 'drank:one', 'handout'];
     // ("drinknow" = sips that just landed; "drinknow-ride" = what this player ran up on the way
     // to the bar they just reached, which comes with "I drank my tab" right under it.)
-    const isNowSection = (s) => str(s.id).startsWith(NOW_SECTION);
+    const isNowSection = (s) => str(s.id).startsWith(NOW_SECTION) || s.id === 'welcome'; // ('welcome': a late arrival's "You're in")
     const nowSections = sections.filter(isNowSection);
     const restSections = sections.filter((s) => !isNowSection(s));
     const settleNow = nowSections.some((s) => s.id === `${NOW_SECTION}-ride`);
@@ -2558,8 +2558,8 @@ function buildPrompt(pid, entry, opts = {}) {
   anon && h('div', { class: 'pill anon', text: 'Anonymous' }),
   fs,
   answered && anon
-    ? h('div', { class: 'p-state', 'data-testid': 'vote-sent' }, 'Vote sent', icon('check', 16))
-    : h('div', { class: 'p-state', text: answered ? `Sent: ${entry.label}` : '' }));
+    ? h('div', { class: 'p-state', 'data-testid': 'vote-sent' }, 'Vote sent', icon('check', 16), kind === 'vote' ? ' Waiting for the others.' : null)
+    : h('div', { class: 'p-state', text: answered ? `Sent: ${entry.label}${kind === 'vote' ? '. Waiting for the others.' : ''}` : '' }));
   if (num(p.endsAt) != null) el.dataset.expires = String(p.endsAt);
   if (isLockable(p)) el.dataset.lockable = '1';
   if (opts.named) el.dataset.tapLabel = `${who}: TAP!`;
