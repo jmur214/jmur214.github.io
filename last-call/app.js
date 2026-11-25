@@ -2012,11 +2012,16 @@ const UPDATE = {
     // (loans, Pacts, roles' powers…), drawn small so it doesn't read as "do this".
     const isNow = (a) => a.id.startsWith('card:') || a.id.startsWith('tab@') || a.id === 'polygraph:refuse';
     const EVERYDAY = ['drank', 'drank:one', 'handout'];
-    const nowSections = sections.filter((s) => s.id === NOW_SECTION);
-    const restSections = sections.filter((s) => s.id !== NOW_SECTION);
-    const nowActions = actions.filter(isNow);
-    const mainActions = actions.filter((a) => !isNow(a) && EVERYDAY.includes(a.id));
-    const moreActions = actions.filter((a) => !isNow(a) && !EVERYDAY.includes(a.id));
+    // ("drinknow" = sips that just landed; "drinknow-ride" = what this player ran up on the way
+    // to the bar they just reached, which comes with "I drank my tab" right under it.)
+    const isNowSection = (s) => str(s.id).startsWith(NOW_SECTION);
+    const nowSections = sections.filter(isNowSection);
+    const restSections = sections.filter((s) => !isNowSection(s));
+    const settleNow = nowSections.some((s) => s.id === `${NOW_SECTION}-ride`);
+    const isNowAction = (a) => isNow(a) || (settleNow && a.id === 'drank');
+    const nowActions = actions.filter(isNowAction);
+    const mainActions = actions.filter((a) => !isNowAction(a) && EVERYDAY.includes(a.id));
+    const moreActions = actions.filter((a) => !isNowAction(a) && !EVERYDAY.includes(a.id));
     // A card is up and it isn't yours: say so, so nobody hunts for buttons.
     const cardUp = !!(room && room.card) && ['warmup', 'main', 'lastcall'].includes(str(room.phase));
     const cardIsMine = !!currentSpotlight(room, pid, priv) || nowActions.some((a) => a.id.startsWith('card:'));
