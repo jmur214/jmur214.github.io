@@ -105,6 +105,11 @@ const ICONS = {
   // 11/20 build: How to play, the Table's low battery.
   book: ['M3.5 5.5h6a2.5 2.5 0 0 1 2.5 2.5v11a2 2 0 0 0-2-2H3.5z', 'M20.5 5.5h-6A2.5 2.5 0 0 0 12 8v11a2 2 0 0 1 2-2h6.5z'],
   battery: ['M3 8h15v8H3z', 'M21 10.5v3', 'M6 11v2'],
+  // 11/27: the folds ("My stuff", "The Table") and the walkthrough's pointer.
+  down: ['M5 9l7 7 7-7'],
+  up: ['M5 15l7-7 7 7'],
+  lock: ['M6 11h12v9H6z', 'M8.5 11V8a3.5 3.5 0 0 1 7 0v3'],
+  point: ['M12 21V8', 'M6 13l6-6 6 6'],
 };
 
 /** icon('eye', 20) -> a decorative <svg> (aria-hidden; the button's text is its label). */

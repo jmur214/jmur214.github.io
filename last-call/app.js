@@ -140,6 +140,13 @@ const S = {
   addingPlayer: false,
   notice: null,
   peek: {}, // `${pid}:${sectionId}` -> until
+  // 11/27 folds (Jackson: "we still want everything, just … streamlined how its played"): during
+  // the cards a phone shows the card and its buttons; the Tab, the Bank, the secrets and every
+  // extra button sit behind one "My stuff" row, the list of players behind another.
+  stuffOpen: {}, // playerId -> true while their "My stuff" is open
+  stuffSeen: {}, // playerId -> what was in it when they last looked (the row's "new" dot)
+  tableOpen: false, // the list of players is open
+  foldsOpen: false, // ?open=all (tests, and a look at everything at once): both start open
   modal: null, // { id, title, text, buttons: [{ label, style, run }] }
   toast: null, // { text, until }
   recap: null, // playerId whose Wrapped story is open (11/20: a story you tap through)
@@ -210,6 +217,7 @@ function boot() {
   }
   try {
     const kind = new URLSearchParams(location.search).get('transport') === 'local' ? 'local' : 'supabase';
+    if (new URLSearchParams(location.search).get('open') === 'all') { S.foldsOpen = true; S.tableOpen = true; }
     transport = createTransport({ kind, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_ANON_KEY });
   } catch (err) {
     console.error(err);
@@ -690,7 +698,7 @@ function onRoomChanged(prev, room) {
   // stays put (and keeps its page): a late joiner could never finish it otherwise (11/24 review).
   if (S.howTo && ((prev && str(prev.phase) !== str(room.phase)) || (newCard && S.howTo.auto) || !howToPages(room).length)) S.howTo = null;
   if (!S.howTo && str(room.phase) === 'lobby' && howToPages(room).length && S.sessions.length && !store.getHowToSeen(S.roomId)) {
-    S.howTo = { index: 0, auto: true };
+    S.howTo = { index: 0, auto: true, tour: true };
     store.setHowToSeen(S.roomId);
   }
   if (newCard) {
@@ -767,6 +775,13 @@ function storeWrapped(session, w) {
 async function startJoin(name, claimPlayerId, opts = {}) {
   name = str(name).trim().slice(0, 32);
   if (!name || (S.joining && (S.joining.status === 'waiting' || S.joining.status === 'opening'))) return;
+  // Typed the name of a seat that's waiting for them (11/27: "Matt" typed, not tapped, became
+  // "Matt 2"): take that seat, the same as tapping the name. Only when exactly one fits.
+  if (!claimPlayerId && !opts.move) {
+    const same = arr(S.room?.players).map(obj).filter((p) => p.claimed === false && str(p.id) &&
+      str(p.name).trim().toLowerCase() === name.toLowerCase());
+    if (same.length === 1) claimPlayerId = same[0].id;
+  }
   unlockAudio(); // this tap is what lets the page chime later on iPhones
   S.joining = {
     name, claimPlayerId: claimPlayerId || null, move: !!opts.move,
@@ -838,7 +853,8 @@ function confirmMove(playerId, name) {
   const leader = str(S.room?.leaderName) || 'The leader';
   openModal({
     title: `Move ${name} to this phone?`,
-    text: `${leader} gets asked on their phone. Once they say yes, ${name}'s old phone stops working. Your tab and Bank come with you.`,
+    text: `${leader} gets asked on their phone. Once they say yes, ${name}'s old phone stops working.`
+      + (S.room?.simple === true ? '' : ' Your tab and Bank come with you.'),
     buttons: [
       { label: 'Cancel', style: 'ghost' },
       { label: 'Move me', style: 'primary', run: () => startJoin(name, playerId, { move: true }) },
@@ -1754,6 +1770,13 @@ const MOUNT = {
       curses: h('section', { class: 'curses' }),
       me: h('section', { class: 'me' }),
       priv: h('section', { class: 'private' }),
+      // 11/27: "My stuff" (Tab, Bank, secrets, the extra buttons), closed until they want it.
+      // (The row and what it opens are separate regions: the row is only rebuilt when the row
+      // itself changes. Rebuilt under a finger, a button loses the tap.)
+      stuffRow: h('div', { class: 'stuff-row' }),
+      stuffBody: h('div', { class: 'stuff-body-wrap' }),
+      stuff: null,
+      tableRow: h('div', { class: 'fold-row' }),
       players: h('section', { class: 'players' }),
       ticker: h('section', { class: 'ticker' }),
       foot: h('footer', { class: 'foot' }),
@@ -1768,11 +1791,12 @@ const MOUNT = {
       // pill fixed above the sheet (it takes no room, so nothing moves when it goes mid-tap).
       unlock: h('div', { class: 'unlock-wrap' }),
     };
+    v.stuff = h('section', { class: 'stuff-wrap' }, v.stuffRow, v.stuffBody);
     v.root = h(
       'main',
       { class: 'screen game' },
       h('header', { class: 'top' }, brand(), v.phase),
-      v.strip, v.battery, v.turn, v.profiles, v.stale, v.card, v.now, v.rules, v.curses, v.me, v.priv, v.players, v.ticker, v.foot, v.unlock,
+      v.strip, v.battery, v.turn, v.profiles, v.stale, v.card, v.now, v.rules, v.curses, v.me, v.priv, v.stuff, v.tableRow, v.players, v.ticker, v.foot, v.unlock,
     );
     return v;
   },
@@ -1892,7 +1916,16 @@ const UPDATE = {
 
     // Header phase chip. During the Last Call round: "Last Call · 3 cards to the Finale".
     const lastLeft = num(room?.lastCallLeft);
-    region(V.phase, [str(room?.phase), str(room?.vibe), num(room?.cardCount), lastLeft], ([phase, vibe, count, left]) => [
+    // "Just cards" (11/27, optional room.simple): there's no warm-up, main game or Finale to tell
+    // apart, so the only chip is the Last Call countdown.
+    const simple = room?.simple === true;
+    region(V.phase, [str(room?.phase), str(room?.vibe), num(room?.cardCount), lastLeft, simple], ([phase, vibe, count, left, plain]) => plain ? [
+      left != null && h('span', {
+        class: 'chip phase-lastcall countdown', 'data-testid': 'lastcall-left',
+        text: `Last Call · ${left <= 1 ? 'last card' : `${left} cards left`}`,
+      }),
+      left == null && !PLAYING.includes(phase) && phase && h('span', { class: `chip phase-${phase}`, text: PHASES[phase] || titleCase(phase) }),
+    ] : [
       phase && h('span', {
         class: `chip phase-${phase}${left != null ? ' countdown' : ''}`, 'data-testid': left != null ? 'lastcall-left' : null,
         text: left != null
@@ -1952,11 +1985,13 @@ const UPDATE = {
 
     // A late joiner's quick rules (11/20 build, Jackson's four lines), for their first 3 cards.
     const late = lateRulesFor(me, room);
-    region(V.rules, late ? [howToPages(room).length > 0] : null, (d) => d && h('section', { class: 'quick-rules', 'data-testid': 'quick-rules' },
-      h('span', { class: 'quick-rules-title', text: 'Quick rules' }),
-      h('ul', { class: 'quick-rules-list' }, QUICK_RULES.map((t) => h('li', { text: t }))),
-      d[0] && h('button', { class: 'btn small', type: 'button', 'data-testid': 'quick-rules-more', onclick: () => openHowTo() }, icon('book', 18), 'How to play')));
-    V.rules.hidden = !late;
+    // 11/27: it was five lines to read on top of the Table's own "You're in" box. Now it is one
+    // button: the same ten-second picture tour everyone else got in the lobby.
+    const canTour = howToPages(room).length > 0;
+    region(V.rules, late && canTour ? [simple] : null, (d) => d && h('section', { class: 'quick-rules', 'data-testid': 'quick-rules' },
+      h('span', { class: 'quick-rules-title', text: 'New here?' }),
+      h('button', { class: 'btn small', type: 'button', 'data-testid': 'quick-rules-more', onclick: () => openHowTo(true) }, icon('book', 18), 'Show me around (10 seconds)')));
+    V.rules.hidden = !(late && canTour);
 
     renderCard(room, pid, priv);
 
@@ -1980,14 +2015,20 @@ const UPDATE = {
     const bank = num(you.bank, num(pub.bank, 0));
     const oweText = drinkAmountShort(owe, perDrink, shots);
     const meter = you.drink ?? null; // 11/20 economy #3 (see drinkMeterLine below)
-    region(V.me, [sessionName(me), owe, oweText, bank, meter], ([name, o, ot, b, m]) => [
+    // During the cards the whole game folds its extras into "My stuff" (below). Everywhere else
+    // (the lobby, the writing, the Finale, the end) the numbers sit in the open as before.
+    const folded = PLAYING.includes(str(room?.phase)) && !simple;
+    const statTiles = (o, ot, b) => h('div', { class: 'me-stats' },
+      h('div', { class: `stat owe${o > 0 ? ' hot' : ''}`, 'data-testid': 'owe' }, h('span', { class: 'stat-l', text: 'Tab' }),
+        h('span', { class: `stat-n${ot !== String(o) ? ' words' : ''}`, text: ot })),
+      h('div', { class: 'stat bank', 'data-testid': 'bank' }, h('span', { class: 'stat-l', text: 'Bank' }), h('span', { class: 'stat-n', text: String(b) })));
+    region(V.me, [sessionName(me), owe, oweText, bank, meter, simple, folded], ([name, o, ot, b, m, plain, fold]) => fold ? [] : [
       h('div', { class: 'me-name' }, h('span', { class: 'dim', text: 'You are' }), h('b', { text: name })),
-      h('div', { class: 'me-stats' },
-        h('div', { class: `stat owe${o > 0 ? ' hot' : ''}`, 'data-testid': 'owe' }, h('span', { class: 'stat-l', text: 'Tab' }),
-          h('span', { class: `stat-n${ot !== String(o) ? ' words' : ''}`, text: ot })),
-        h('div', { class: 'stat bank', 'data-testid': 'bank' }, h('span', { class: 'stat-l', text: 'Bank' }), h('span', { class: 'stat-n', text: String(b) }))),
-      drinkMeterLine(m),
+      // (Just cards: no Tab, no Bank, no running count. Just who you are.)
+      !plain && statTiles(o, ot, b),
+      !plain && drinkMeterLine(m),
     ]);
+    V.me.hidden = folded;
 
     // Private sections + actions
     const now = Date.now();
@@ -2022,6 +2063,16 @@ const UPDATE = {
     const nowActions = actions.filter(isNowAction);
     const mainActions = actions.filter((a) => !isNowAction(a) && EVERYDAY.includes(a.id));
     const moreActions = actions.filter((a) => !isNowAction(a) && !EVERYDAY.includes(a.id));
+    // Folded: what stays in the open is what needs doing (a tab to drink, a rule on you, a
+    // notice); what goes in "My stuff" is what is simply yours (role, mission, clue, money, the
+    // Bank's Hand out, and every extra button). A box this page doesn't know stays in the open.
+    const inStuff = (sec) => folded && STUFF_SECTIONS.includes(str(sec.id));
+    const openSections = restSections.filter((sec) => !inStuff(sec));
+    const stuffSections = restSections.filter(inStuff);
+    const openActions = folded ? mainActions.filter((a) => a.id !== 'handout') : mainActions;
+    const stuffMain = folded ? mainActions.filter((a) => a.id === 'handout') : [];
+    const openMore = folded ? [] : moreActions;
+    const stuffMore = folded ? moreActions : [];
     // A card is up and it isn't yours: say so, so nobody hunts for buttons.
     const cardUp = !!(room && room.card) && ['warmup', 'main', 'lastcall'].includes(str(room.phase));
     const cardIsMine = !!currentSpotlight(room, pid, priv) || nowActions.some((a) => a.id.startsWith('card:'));
@@ -2035,28 +2086,67 @@ const UPDATE = {
       watching && h('p', { class: 'watch-note', 'data-testid': 'not-your-card', text: 'Not your card. Watch.' }),
     ]);
     V.now.hidden = !(nowSections.length || nowActions.length || watching);
-    region(V.priv, [pid, restSections, peeked, allActions, pressed, locked, held], () => [
-      restSections.length > 0 && h('div', { class: 'sections' }, restSections.map((s) =>
-        renderSection(pid, s, peeked.includes(s.id), allActions.filter((a) => homeOf(a) === s.id), pressed, locked))),
-      mainActions.length > 0 && h('div', { class: 'actions' }, mainActions.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false))),
-      moreActions.length > 0 && h('div', { class: 'actions more' },
-        h('span', { class: 'more-label', text: 'More' }),
-        moreActions.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false))),
+    const sectionList = (list) => list.length > 0 && h('div', { class: 'sections' }, list.map((sec) =>
+      renderSection(pid, sec, peeked.includes(sec.id), allActions.filter((a) => homeOf(a) === sec.id), pressed, locked)));
+    const mainList = (list) => list.length > 0 && h('div', { class: 'actions' }, list.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false)));
+    const moreList = (list) => list.length > 0 && h('div', { class: 'actions more' },
+      h('span', { class: 'more-label', text: 'More' }),
+      list.map((a) => actionButton(pid, a, pressed.includes(a.id), locked, false)));
+    region(V.priv, [pid, openSections, peeked, allActions, pressed, locked, held, folded], () => [
+      sectionList(openSections), mainList(openActions), moreList(openMore),
     ]);
+
+    // "My stuff": one row, closed until they tap it. It says what's inside in three small
+    // chips (a tab, the Bank, a lock for the secrets) and wears a dot when something in it is
+    // new since they last looked.
+    const stuffOpen = folded && (S.stuffOpen[pid] ?? S.foldsOpen);
+    const stuffSig = JSON.stringify([stuffSections.map((sec) => [sec.id, sec.hidden === true ? '' : str(sec.title)]),
+      stuffMain.concat(stuffMore).map((a) => a.id)]);
+    if (stuffOpen) S.stuffSeen[pid] = stuffSig;
+    const stuffNew = folded && !stuffOpen && S.stuffSeen[pid] !== stuffSig;
+    const hasSecret = stuffSections.some((sec) => sec.hidden === true);
+    region(V.stuffRow, folded ? [pid, sessionName(me), stuffOpen, stuffNew, owe, oweText, bank, hasSecret] : null, (d) => d &&
+      h('button', {
+        class: `stuff-toggle${stuffOpen ? ' open' : ''}`, type: 'button', 'data-testid': 'stuff-toggle', 'aria-expanded': String(stuffOpen),
+        onclick: () => { S.stuffOpen[pid] = !stuffOpen; render(); },
+      },
+      h('span', { class: 'stuff-name' }, h('b', { text: 'My stuff' }), h('span', { class: 'dim', text: sessionName(me) })),
+      h('span', { class: 'stuff-chips' },
+        owe > 0 && h('span', { class: 'stuff-chip owe', 'data-testid': 'stuff-tab', text: `Tab ${oweText}` }),
+        h('span', { class: 'stuff-chip bank', 'data-testid': 'stuff-bank', text: `Bank ${bank}` }),
+        hasSecret && h('span', { class: 'stuff-chip lock', 'aria-label': 'secrets inside' }, icon('lock', 16)),
+        stuffNew && h('span', { class: 'stuff-dot', 'data-testid': 'stuff-new', 'aria-label': 'something new' })),
+      icon(stuffOpen ? 'up' : 'down', 20)));
+    region(V.stuffBody, stuffOpen ? [pid, owe, oweText, bank, meter, stuffSections, peeked, allActions, pressed, locked, held] : null, (d) => d &&
+      h('div', { class: 'stuff-body', 'data-testid': 'stuff-body' },
+        statTiles(owe, oweText, bank),
+        drinkMeterLine(meter),
+        sectionList(stuffSections), mainList(stuffMain), moreList(stuffMore)));
+    V.stuffBody.hidden = !stuffOpen;
+    V.stuff.hidden = !folded;
 
     // Players strip
     const players = arr(room?.players).map(obj).filter((p) => str(p.id));
-    region(V.players, [players, pid, perDrink, shots], ([list, active]) => !list.length ? [] : [
-      h('h2', { class: 'section-label', text: 'The Table' }),
+    // 11/27: closed during the cards (a grid of everyone's numbers is not what a card needs).
+    const playingNow = PLAYING.includes(str(room?.phase));
+    const tableOpen = !playingNow || S.tableOpen;
+    region(V.tableRow, playingNow && players.length ? [players.length, S.tableOpen] : null, (d) => d &&
+      h('button', {
+        class: `fold-toggle${d[1] ? ' open' : ''}`, type: 'button', 'data-testid': 'table-toggle', 'aria-expanded': String(d[1]),
+        onclick: () => { S.tableOpen = !S.tableOpen; render(); },
+      }, h('b', { text: 'The Table' }), h('span', { class: 'dim', text: `${d[0]} playing` }), icon(d[1] ? 'up' : 'down', 20)));
+    V.tableRow.hidden = !(playingNow && players.length);
+    region(V.players, [players, pid, perDrink, shots, simple, tableOpen, playingNow], ([list, active, , , plain, open, playing]) => !list.length || !open ? [] : [
+      !playing && h('h2', { class: 'section-label', text: 'The Table' }),
       h('ul', { class: 'player-grid' }, list.map((p) =>
         h('li', { class: `pl${p.id === active ? ' me' : ''}${p.online === false ? ' off' : ''}`, 'data-pl': p.id },
           h('div', { class: 'pl-name', text: str(p.name) || '?' }),
-          h('div', { class: 'pl-nums' },
+          !plain && h('div', { class: 'pl-nums' },
             h('span', { class: 'pl-owe', text: `Tab ${drinkAmountShort(num(p.owe, 0), perDrink, shots)}` }),
             h('span', { class: 'pl-bank', text: `Bank ${num(p.bank, 0)}` })),
           arr(p.badges).length > 0 && h('div', { class: 'pl-badges' }, arr(p.badges).map((b) => h('span', { class: 'pill', text: str(b) })))))),
     ]);
-    V.players.hidden = !players.length;
+    V.players.hidden = !players.length || !tableOpen;
 
     // Ticker (newest first)
     const ticker = arr(room?.ticker).map(str).filter(Boolean).slice(-6).reverse();
@@ -2064,7 +2154,8 @@ const UPDATE = {
       h('h2', { class: 'section-label', text: 'Just happened' }),
       h('ul', { class: 'ticker-list' }, lines.map((t) => h('li', { text: t }))),
     ]);
-    V.ticker.hidden = !ticker.length;
+    // (11/27: with the list of players, behind "The Table", during the cards.)
+    V.ticker.hidden = !ticker.length || (PLAYING.includes(str(room?.phase)) && !S.tableOpen);
 
     const hasHowTo = howToPages(room).length > 0 && room?.phase !== 'ended';
     region(V.foot, [S.sessions.length, S.chime, hasHowTo], ([, ch, howTo]) => [
@@ -2161,7 +2252,8 @@ function renderCard(room, pid, priv) {
       // No card up (an interrupt, the Finale): a spotlight still shows (e.g. "THE SNAKE
       // STRUCK YOU", "Settle up: drink 3 sips").
       const idle = h('div', { class: 'card idle' },
-        h('div', { class: 'card-band' }, h('span', { class: 'card-kind', text: PHASES[d.phase] || titleCase(d.phase) || 'Last Call' })),
+        // ("Warm-up" / "Main game" told a friend nothing: 11/27. Only the phases they can see.)
+        h('div', { class: 'card-band' }, h('span', { class: 'card-kind', text: PLAYING.includes(d.phase) ? 'Last Call' : (PHASES[d.phase] || titleCase(d.phase) || 'Last Call') })),
         h('div', { class: 'card-idle-body' },
           h('p', { class: 'card-text', text: d.ended ? "That's a wrap. Thanks for playing!" : 'Eyes on the Table.' }),
           d.ended && d.hasRecap && h('button', { class: 'btn primary', 'data-testid': 'see-wrapped', text: 'See your Wrapped', onclick: () => { openStory(pid); render(); } }),
@@ -2894,16 +2986,57 @@ function swipeable(el, step) {
 // none: no walkthrough.
 
 /** Tonight's pages from the room, every field checked. */
+// 11/27 (Jackson: "a lot of reading right off the bat is just initially scary … visuals are a lot
+// less taxing … maybe even a walk through of the screen"): a page can carry `art`, the part of this
+// very screen it is about, and the page draws a small picture of the screen with that part lit up
+// (tourArt). `optional` pages are extras: the tour that opens by itself in the lobby leaves them
+// out; the "How to play" button shows everything. An older Table sends neither: words, as before.
+const TOUR_ART = ['card', 'buttons', 'drink', 'stuff', 'bank', 'secret'];
+
 function howToPages(room) {
   return arr(room?.howTo).map(obj)
-    .map((p) => ({ id: str(p.id).slice(0, 40), title: str(p.title), lines: arr(p.lines).map(str).filter(Boolean).slice(0, 6), color: lightColor(p.color, STORY_YELLOW) }))
+    .map((p) => ({
+      id: str(p.id).slice(0, 40), title: str(p.title), lines: arr(p.lines).map(str).filter(Boolean).slice(0, 6),
+      color: lightColor(p.color, STORY_YELLOW), art: TOUR_ART.includes(p.art) ? p.art : null, optional: p.optional === true,
+    }))
     .filter((p) => p.title && p.lines.length);
 }
 
-function openHowTo() {
+/** The pages on show right now: the short tour (no extras) when it opened by itself or from
+ *  "Show me around"; everything from the "How to play" button. */
+function howToShown(room) {
+  const all = howToPages(room);
+  if (!S.howTo || !S.howTo.tour) return all;
+  const tour = all.filter((p) => !p.optional);
+  return tour.length ? tour : all;
+}
+
+function openHowTo(tour = false) {
   if (!howToPages(S.room).length) return;
-  S.howTo = { index: 0, auto: false };
+  S.howTo = { index: 0, auto: false, tour };
   render();
+}
+
+/** A small picture of this page's own screen with one part lit up. `art`: which part. */
+function tourArt(art, simple) {
+  const lit = (name) => (name === art ? ' lit' : '');
+  const bars = () => [h('i'), h('i'), h('i', { class: 'short' })];
+  if (art === 'bank' || art === 'secret') {
+    // "My stuff", opened.
+    return h('div', { class: 'tour-phone', 'data-art': art, 'aria-hidden': 'true' },
+      h('div', { class: 'tp-stuff open' }, h('b', { text: 'My stuff' }), icon('up', 16)),
+      h('div', { class: `tp-tiles${lit('bank')}` },
+        h('div', { class: 'tp-tile' }, h('small', { text: 'Tab' }), h('b', { class: 'owe', text: '2' })),
+        h('div', { class: 'tp-tile' }, h('small', { text: 'Bank' }), h('b', { class: 'bank', text: '3' }))),
+      h('div', { class: `tp-secret${lit('secret')}` }, icon('eye', 22), h('span', { text: 'Tap to peek' })),
+      h('div', { class: `tp-btn wide${lit('bank')}`, text: 'Hand out sips' }));
+  }
+  return h('div', { class: 'tour-phone', 'data-art': art, 'aria-hidden': 'true' },
+    h('div', { class: `tp-card${lit('card')}` }, h('span', { class: 'tp-band', text: 'Dare' }), ...bars()),
+    h('div', { class: `tp-btns${lit('buttons')}` },
+      h('span', { class: 'tp-btn dark', text: 'I did it' }), h('span', { class: 'tp-btn red', text: 'Refuse' })),
+    h('div', { class: `tp-drink${lit('drink')}` }, icon('glass', 18), h('b', { text: 'DRINK NOW: 2 sips' })),
+    !simple && h('div', { class: `tp-stuff${lit('stuff')}` }, h('b', { text: 'My stuff' }), h('span', { class: 'tp-chip', text: 'Bank 3' }), icon('down', 16)));
 }
 
 function closeHowTo() {
@@ -2913,7 +3046,7 @@ function closeHowTo() {
 }
 
 function howToGo(i) {
-  const n = howToPages(S.room).length;
+  const n = howToShown(S.room).length;
   if (!S.howTo || !n) return;
   if (i >= n) return closeHowTo();
   S.howTo.index = Math.max(0, i);
@@ -2921,26 +3054,35 @@ function howToGo(i) {
 }
 
 function renderHowTo(view) {
-  const pages = view === 'game' && S.howTo ? howToPages(S.room) : [];
+  const pages = view === 'game' && S.howTo ? howToShown(S.room) : [];
   const i = pages.length ? Math.max(0, Math.min(S.howTo.index, pages.length - 1)) : 0;
-  region(layers.howto, pages.length ? [pages, i] : null, () => {
+  const plain = S.room?.simple === true;
+  region(layers.howto, pages.length ? [pages, i, plain] : null, () => {
     if (!pages.length) return null;
     const p = pages[i];
     const last = i === pages.length - 1;
+    // (An older Table sends pages of words with no pictures: that is still "How to play".)
+    const tour = !!S.howTo.tour && pages.some((pg) => pg.art);
     const el = h('div', {
       class: 'overlay howto', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How to play',
       'data-testid': 'howto', 'data-page': p.id, 'data-index': String(i), style: { '--howto-bg': p.color },
     },
     h('div', { class: 'howto-top' },
-      h('span', { class: 'howto-count', text: `How to play · ${i + 1} of ${pages.length}` }),
+      h('span', { class: 'howto-count', text: `${tour ? 'Quick tour' : 'How to play'} · ${i + 1} of ${pages.length}` }),
       h('button', { class: 'btn small', type: 'button', 'data-testid': 'howto-skip', text: 'Skip', onclick: closeHowTo })),
-    h('div', { class: 'howto-body' },
-      h('h2', { class: 'howto-title', 'data-testid': 'howto-title', text: p.title, style: { '--fit': String(longestWord(p.title)) } }),
-      h('ol', { class: 'howto-lines' }, p.lines.map((l, k) => h('li', {}, h('b', { class: 'howto-n', text: String(k + 1) }), h('span', { text: l }))))),
+    p.art
+      // A picture of this screen with one part lit up, its name, and a line or two.
+      ? h('div', { class: 'howto-body tour', 'data-testid': 'howto-tour' },
+        tourArt(p.art, plain),
+        h('h2', { class: 'howto-title tour-title', 'data-testid': 'howto-title', text: p.title, style: { '--fit': String(longestWord(p.title)) } }),
+        h('div', { class: 'tour-lines' }, p.lines.map((l) => h('p', { text: l }))))
+      : h('div', { class: 'howto-body' },
+        h('h2', { class: 'howto-title', 'data-testid': 'howto-title', text: p.title, style: { '--fit': String(longestWord(p.title)) } }),
+        h('ol', { class: 'howto-lines' }, p.lines.map((l, k) => h('li', {}, h('b', { class: 'howto-n', text: String(k + 1) }), h('span', { text: l }))))),
     h('div', { class: 'howto-dots', 'aria-hidden': 'true' }, pages.map((_, k) => h('i', { class: k === i ? 'on' : null }))),
     h('div', { class: 'howto-foot' },
       i > 0 && h('button', { class: 'btn small', type: 'button', 'data-testid': 'howto-back', text: 'Back', onclick: () => howToGo(i - 1) }),
-      h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'howto-next', text: last ? "Let's play" : 'Next', onclick: () => howToGo(i + 1) })),
+      h('button', { class: 'btn primary big', type: 'button', 'data-testid': 'howto-next', text: last ? (tour ? 'Got it' : "Let's play") : 'Next', onclick: () => howToGo(i + 1) })),
     h('p', { class: 'howto-note', text: 'Phone locked? Just open this page again.' }));
     swipeable(el, (d) => howToGo(i + d));
     return el;
@@ -2954,7 +3096,9 @@ function renderHowTo(view) {
 // (11/24 review: the second line was added; people with no buttons thought their phone was broken.)
 // The Table's "DRINK NOW: 3 sips" box (sips that just landed on this player).
 const NOW_SECTION = 'drinknow';
-const QUICK_RULES = ['Do it, or refuse and drink.', 'No buttons? It\u2019s not your card.', 'Tab is sips you put off.', 'Bank is sips you can give away.', 'Phone locked? Reopen this page.'];
+// "My stuff" (11/27): the boxes that are simply yours, not something to do right now. The ids are
+// the Table's (LastCallEngine+Views / +Missions / +Roles / +Economy). Any other box stays in the open.
+const STUFF_SECTIONS = ['role', 'mission', 'tipoff', 'thumb', 'publicrole', 'money'];
 const QUICK_RULES_CARDS = 3;
 const PLAYING = ['warmup', 'main', 'lastcall'];
 

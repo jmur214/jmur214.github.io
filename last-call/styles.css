@@ -376,6 +376,34 @@ section.me:empty { display: none; }
 .drink-meter-bar { display: block; height: 8px; border: 2px solid var(--ink); border-radius: 999px; background: var(--surface); overflow: hidden; }
 .drink-meter-fill { display: block; height: 100%; background: var(--green); }
 
+/* ---------- the folds (11/27): "My stuff" and "The Table", closed during the cards ---------- */
+
+.stuff-wrap { display: flex; flex-direction: column; gap: 14px; }
+.stuff-wrap:empty { display: none; }
+.stuff-toggle, .fold-toggle {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 56px; padding: 10px 14px;
+  font: inherit; color: var(--ink); text-align: left; cursor: pointer;
+  background: var(--surface); border: var(--border); border-radius: var(--radius-panel); box-shadow: var(--shadow-small);
+  -webkit-tap-highlight-color: transparent;
+}
+.stuff-toggle:active, .fold-toggle:active { translate: 2px 2px; box-shadow: 1px 1px 0 var(--ink); }
+.stuff-toggle.open, .fold-toggle.open { background: var(--bg); }
+.stuff-name { display: flex; flex-direction: column; min-width: 0; line-height: 1.15; }
+.stuff-name b, .fold-toggle b { font-size: 18px; font-weight: 800; }
+.stuff-name .dim, .fold-toggle .dim { font-size: 13px; font-weight: 700; color: var(--soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fold-toggle .dim { flex: 1; }
+.stuff-chips { flex: 1; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; min-width: 0; }
+.stuff-chip {
+  display: inline-flex; align-items: center; padding: 3px 9px; font-size: 14px; font-weight: 800; font-variant-numeric: tabular-nums;
+  border: 2px solid var(--ink); border-radius: 999px; background: var(--surface); white-space: nowrap;
+}
+.stuff-chip.owe { color: var(--owe); }
+.stuff-chip.bank { color: var(--bank); }
+.stuff-chip.lock { padding: 3px 6px; background: var(--private-bg); color: #fff; }
+.stuff-dot { width: 14px; height: 14px; border-radius: 999px; background: var(--dare); border: 2px solid var(--ink); }
+.stuff-body { display: flex; flex-direction: column; gap: 16px; }
+.stuff-toggle .icon, .fold-toggle .icon { flex: none; }
+
 /* ---------- private sections + actions ---------- */
 
 .private { display: flex; flex-direction: column; gap: 18px; }
@@ -810,6 +838,41 @@ section.me:empty { display: none; }
   flex: none; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%;
   background: var(--ink); color: var(--surface); font-size: 16px; line-height: 1;
 }
+/* The picture tour (11/27): a small drawing of this page's own screen with one part lit up.
+   Everything in it is the real thing in miniature (same colors, same outlines), so it reads as
+   "that's where it will be". The part a page is about is `.lit`; the rest is faded. */
+.howto-body.tour { align-items: center; gap: 12px; }
+.tour-phone {
+  width: min(250px, 68vw); display: flex; flex-direction: column; gap: 9px; padding: 14px 12px 16px;
+  background: var(--bg); border: 4px solid var(--ink); border-radius: 30px; box-shadow: 8px 8px 0 var(--ink); rotate: -2deg;
+}
+.tour-phone > * { opacity: .26; transition: opacity .15s; }
+.tour-phone > .lit { opacity: 1; outline: 4px solid var(--ink); outline-offset: 3px; box-shadow: 0 0 0 9px var(--surface); animation: pop .22s ease-out; }
+.tp-card { display: flex; flex-direction: column; gap: 6px; padding: 0 0 10px; background: var(--surface); border: 3px solid var(--ink); border-radius: 14px; overflow: hidden; }
+.tp-band { padding: 3px 10px; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; background: var(--dare); border-bottom: 3px solid var(--ink); }
+.tp-card i { display: block; height: 7px; margin: 0 10px; border-radius: 99px; background: var(--ink); }
+.tp-card i.short { width: 45%; }
+.tp-btns { display: flex; gap: 6px; border-radius: 12px; }
+.tp-btn { flex: 1; padding: 8px 4px; font-size: 13px; font-weight: 800; text-align: center; border: 3px solid var(--ink); border-radius: 10px; background: var(--surface); }
+.tp-btn.dark { background: var(--ink); color: #fff; }
+.tp-btn.red { background: var(--dare); }
+.tp-btn.wide { flex: none; }
+.tp-drink { display: flex; align-items: center; gap: 6px; padding: 8px 10px; font-size: 13px; font-weight: 800; background: var(--green); border: 3px solid var(--ink); border-radius: 12px; }
+.tp-stuff { display: flex; align-items: center; gap: 6px; padding: 7px 10px; font-size: 13px; background: var(--surface); border: 3px solid var(--ink); border-radius: 12px; }
+.tp-stuff b { flex: 1; font-weight: 800; }
+.tp-stuff.open { opacity: .7; }
+.tp-chip { padding: 1px 7px; font-size: 11px; font-weight: 800; color: var(--bank); border: 2px solid var(--ink); border-radius: 99px; }
+.tp-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; border-radius: 12px; }
+.tp-tile { display: flex; flex-direction: column; padding: 4px 9px 6px; background: var(--surface); border: 3px solid var(--ink); border-radius: 10px; }
+.tp-tile small { font-size: 9px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.tp-tile b { font-size: 24px; line-height: 1; font-weight: 800; }
+.tp-tile b.owe { color: var(--owe); }
+.tp-tile b.bank { color: var(--bank); }
+.tp-secret { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 8px; font-size: 13px; font-weight: 800; color: #fff; background: var(--private-bg); border: 3px solid var(--ink); border-radius: 12px; }
+.howto-title.tour-title { margin: 14px 6px 4px 0; padding: 8px 18px; border-radius: 20px; box-shadow: 6px 6px 0 var(--ink); font-size: clamp(26px, 9vw, 40px); }
+.tour-lines { display: flex; flex-direction: column; gap: 8px; align-self: stretch; text-align: center; }
+.tour-lines p { margin: 0; font-size: 21px; line-height: 1.25; font-weight: 800; }
+@media (prefers-reduced-motion: reduce) { .tour-phone > .lit { animation: none; } }
 .howto-dots { display: flex; justify-content: center; gap: 6px; }
 .howto-dots i { width: 8px; height: 8px; border-radius: 999px; background: rgba(17, 17, 17, .22); }
 .howto-dots i.on { width: 22px; background: var(--ink); }
@@ -859,8 +922,11 @@ button.result.secret-result { display: flex; align-items: center; gap: 10px; wid
 /* While it's up, the screen starts below it (11/20 final review: a vote folds the sheet too, and
    the strip sat over "Jake's vote"). */
 body:has(.photo-strip) .screen.game { padding-top: calc(var(--safe-t) + 122px); }
-/* ...and with the chime pill up, the foot scrolls clear above it too. */
-body:has(.unlock) .screen.game { padding-bottom: calc(var(--safe-b) + max(120px, var(--sheet-h, 0px) + 24px) + 64px); }
+/* ...and the foot scrolls clear above the chime pill too. ALWAYS, not only while the pill is up
+   (11/27): the pill goes on the first tap anywhere, and when its 64px went with it a page
+   scrolled to the bottom jumped down 64px between finger-down and finger-up, so that first tap
+   landed on nothing (found by the "My stuff" row's test; "Leave game" had it too). */
+.screen.game { padding-bottom: calc(var(--safe-b) + max(120px, var(--sheet-h, 0px) + 24px) + 64px); }
 
 /* Photo Proof sheet (11/19): the private look (black), the photo on its own card. */
 .layer-photo { position: relative; z-index: 50; }
